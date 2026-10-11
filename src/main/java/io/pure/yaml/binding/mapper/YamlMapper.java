@@ -141,7 +141,8 @@ public final class YamlMapper {
             }
         }
         if (value instanceof String string) {
-            return quoted(string);
+            // Block scalars are always strings, so multi-line text can be written as a readable literal block.
+            return string.indexOf('\n') >= 0 ? new YamlScalar(string, null, null, YamlScalarStyle.LITERAL) : quoted(string);
         }
         if (value instanceof Character character) {
             return quoted(String.valueOf(character));

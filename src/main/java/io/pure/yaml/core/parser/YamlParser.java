@@ -24,6 +24,7 @@ import io.pure.yaml.core.model.YamlStream;
  */
 public final class YamlParser {
     private static final String FLOW_INDICATORS = ",[]{}";
+    private static final int MAX_IMPLICIT_KEY_LENGTH = 1024;
 
     private final String text;
     private final YamlProcessingLimits limits;
@@ -309,6 +310,7 @@ public final class YamlParser {
                     throw new YamlParseException("Expected a mapping entry at line " + line.lineNumber());
                 }
                 index++;
+                ensureImplicitKeyLength(content, 0, separator, line.lineNumber());
                 YamlNode key = parseKey(content.substring(0, separator), line.lineNumber(), depth);
                 if (mapping.containsKey(keyText(key))) {
                     throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + line.lineNumber());
@@ -751,6 +753,16 @@ public final class YamlParser {
         return new YamlAlias(name, target);
     }
 
+    /**
+     * Implicit keys, including their properties and the white space before {@code :}, are limited
+     * to 1024 characters (YAML 1.2.2, 7.4.2 and 8.2.1).
+     */
+    private static void ensureImplicitKeyLength(String text, int start, int end, int lineNumber) {
+        if (text.codePointCount(start, end) > MAX_IMPLICIT_KEY_LENGTH) {
+            throw new YamlParseException("Implicit mapping key is longer than " + MAX_IMPLICIT_KEY_LENGTH + " characters at line " + lineNumber);
+        }
+    }
+
     private static YamlNode checkScalarKey(YamlNode key, int lineNumber) {
         YamlNode scalar = key instanceof YamlAlias alias ? alias.target() : key;
         if (!(scalar instanceof YamlScalar value) || value.value() == null) {
@@ -1188,6 +1200,7 @@ public final class YamlParser {
                         throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
                     }
                     int entryLine = lineNumber;
+                    int entryStart = position;
                     YamlNode entry = parseFlowNode(depth);
                     boolean crossedLine = skipSeparation();
                     if (isPairSeparator(entry)) {
@@ -1195,6 +1208,7 @@ public final class YamlParser {
                         if (crossedLine || lineNumber != entryLine) {
                             throw new YamlParseException("Implicit keys must be on a single line at line " + lineNumber);
                         }
+                        ensureImplicitKeyLength(text, entryStart, position, lineNumber);
                         position++;
                         ensureDepth(depth + 1);
                         YamlMapping pair = new YamlMapping();

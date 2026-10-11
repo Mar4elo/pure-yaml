@@ -106,6 +106,7 @@ The current parser/writer supports a safe, practical subset of YAML:
 - scalar mapping keys
 - plain scalars
 - single-quoted scalars
+- implicit keys of up to 1024 characters, as YAML requires
 - double-quoted scalars with the full YAML escape set (`\0`, `\n`, `\t`, `\xXX`, `\uXXXX`, `\UXXXXXXXX`, ...)
 - comments
 - UTF-8 text input; a byte order mark is accepted only at the start of a document, and characters
@@ -274,6 +275,20 @@ tags.add(new YamlScalar("beta"));
 root.put("tags", tags);
 
 String yaml = Yaml.stringify(root);
+```
+
+The writer uses block style. Multi-line text is written as a literal block scalar (`|`) with the
+chomping and indentation indicators its value needs, and falls back to a double-quoted scalar when a
+literal block cannot hold the value (for example a carriage return). Empty nodes are written as empty
+values (`key:`, `-`), and anchors and aliases are written back. Mapping keys are limited to 1024
+characters, as YAML requires for implicit keys.
+
+Documents and streams keep their markers and directives:
+
+```java
+YamlStream stream = Yaml.parseStream(text, limits);
+String yaml = Yaml.stringify(stream);          // every document after "---"
+String single = Yaml.stringify(new YamlDocument(root, "%YAML 1.2"));
 ```
 
 ## Annotations
@@ -673,10 +688,12 @@ The test fails when invalid YAML is accepted, when a parsed tree differs from th
 or when valid YAML is rejected without being listed in
 `src/test/resources/yaml-test-suite/unsupported-cases.txt`. That file lists the cases that use
 syntax outside the supported subset; a case must be removed from it once it starts to pass.
+Every parsed stream is also written with `Yaml.stringify` and read back, and must yield the same
+representation.
 
 Current results: 235 of 308 valid documents are parsed and match the expected JSON; the remaining
 73 use unsupported syntax (tags, complex, empty or non-scalar keys); all 94 invalid documents are
-rejected.
+rejected. All 235 parsed streams survive the writer round trip.
 
 ## Limitations
 
@@ -688,7 +705,7 @@ Before using this library in production, be aware of the current scope:
 - no merge-key support
 - no tag-driven object model
 - alias resolution for object binding is opt-in
-- the writer always uses block style and writes block scalars as double-quoted scalars
+- the writer always uses block style; folded scalars are written as literal blocks
 - no streaming read/write API for very large documents
 
 ## Roadmap

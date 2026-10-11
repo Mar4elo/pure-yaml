@@ -31,7 +31,8 @@ import io.pure.yaml.core.parser.YamlProcessingLimits;
 /**
  * Runs the official yaml-test-suite (https://github.com/yaml/yaml-test-suite, branch "data").
  * The suite location is taken from the YAML_TEST_SUITE_DIR environment variable or the
- * yaml.test.suite.dir system property; without it the test is skipped.
+ * yaml.test.suite.dir system property; without it the test is skipped. Every parsed stream is also
+ * written and read back to check the writer.
  */
 class YamlTestSuiteTest {
     private static final YamlProcessingLimits LIMITS = new YamlProcessingLimits(64, 64, 16, 1_000_000);
@@ -69,19 +70,46 @@ class YamlTestSuiteTest {
                 problems.add(id + ": invalid YAML accepted");
             } else if (unsupported.remove(id)) {
                 problems.add(id + ": listed as unsupported but parsed successfully, remove it from unsupported-cases.txt");
-            } else if (Files.exists(directory.resolve("in.json"))) {
-                String expected = Json.normalize(Files.readString(directory.resolve("in.json")));
-                String actual = stream.documents().stream().map(YamlDocument::root).map(YamlTestSuiteTest::render)
-                    .collect(Collectors.joining("\n"));
-                if (!expected.equals(actual)) {
-                    problems.add(id + ": parsed tree differs from in.json\n    expected: " + expected + "\n    actual:   " + actual);
+            } else {
+                String actual = render(stream);
+                if (Files.exists(directory.resolve("in.json"))) {
+                    String expected = Json.normalize(Files.readString(directory.resolve("in.json")));
+                    if (!expected.equals(actual)) {
+                        problems.add(id + ": parsed tree differs from in.json\n    expected: " + expected + "\n    actual:   " + actual);
+                    }
                 }
+                checkWriterRoundTrip(id, stream, actual, problems);
             }
         }
         unsupported.forEach(id -> problems.add(id + ": listed in unsupported-cases.txt but missing from the suite"));
 
         assertTrue(checked > 300, "Too few yaml-test-suite cases found in " + root + ": " + checked);
         assertTrue(problems.isEmpty(), () -> problems.size() + " yaml-test-suite problems:\n" + String.join("\n", problems));
+    }
+
+    /**
+     * Every parsed stream must be written and read back to the same representation.
+     */
+    private static void checkWriterRoundTrip(String id, YamlStream stream, String expected, List<String> problems) {
+        String written;
+        try {
+            written = Yaml.stringify(stream);
+        } catch (YamlException exception) {
+            problems.add(id + ": parsed stream cannot be written: " + exception.getMessage());
+            return;
+        }
+        try {
+            String actual = render(Yaml.parseStream(written, LIMITS));
+            if (!expected.equals(actual)) {
+                problems.add(id + ": writer round trip differs\n    expected: " + expected + "\n    actual:   " + actual);
+            }
+        } catch (YamlException exception) {
+            problems.add(id + ": written stream cannot be parsed: " + exception.getMessage() + "\n    " + written);
+        }
+    }
+
+    private static String render(YamlStream stream) {
+        return stream.documents().stream().map(YamlDocument::root).map(YamlTestSuiteTest::render).collect(Collectors.joining("\n"));
     }
 
     private static List<Path> caseDirectories(Path root) throws IOException {

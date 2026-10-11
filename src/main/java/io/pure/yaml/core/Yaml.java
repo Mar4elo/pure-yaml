@@ -34,4 +34,12 @@ public final class Yaml {
     public static String stringify(YamlNode node) {
         return new YamlWriter().write(node);
     }
+
+    public static String stringify(YamlDocument document) {
+        return new YamlWriter().write(document);
+    }
+
+    public static String stringify(YamlStream stream) {
+        return new YamlWriter().write(stream);
+    }
 }

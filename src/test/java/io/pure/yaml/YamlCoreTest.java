@@ -3,6 +3,7 @@ package io.pure.yaml;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -80,9 +81,11 @@ class YamlCoreTest {
     @Test
     void parsesAliasesAsDedicatedNodes() {
         YamlMapping mapping = (YamlMapping) Yaml.parse("""
+            anchor: &shared 1
             value: *shared
             """);
-        assertTrue(mapping.get("value") instanceof io.pure.yaml.core.model.YamlAlias);
+        YamlAlias alias = assertInstanceOf(YamlAlias.class, mapping.get("value"));
+        assertSame(mapping.get("anchor"), alias.target());
     }
 
     @Test
@@ -129,9 +132,9 @@ class YamlCoreTest {
 
     @Test
     void rejectsUnsupportedFlowCollections() {
-        assertThrows(YamlParseException.class, () -> Yaml.parse("""
-            values: [1, 2]
-            """));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("{[a, b]: c}"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("[? a : b]"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("[!!str a]"));
     }
 
     @Test
@@ -144,8 +147,9 @@ class YamlCoreTest {
     @Test
     void enforcesAliasLimit() {
         YamlParser parser = new YamlParser("""
+            anchor: &a 1
             first: *a
-            second: *b
+            second: *a
             """, new YamlProcessingLimits(16, 1, 1, 1_000));
 
         assertThrows(YamlParseException.class, parser::parse);
@@ -245,7 +249,7 @@ class YamlCoreTest {
 
     @Test
     void parserInstanceCanBeReused() {
-        YamlParser parser = new YamlParser("- a: 1\n  b: *x\n- c", new YamlProcessingLimits(8, 1, 2, 100));
+        YamlParser parser = new YamlParser("- a: &x 1\n  b: *x\n- c", new YamlProcessingLimits(8, 1, 2, 100));
         YamlNode first = parser.parse().root();
         YamlNode second = parser.parse().root();
         assertEquals(Yaml.stringify(first), Yaml.stringify(second));
@@ -370,9 +374,23 @@ class YamlCoreTest {
         "- a\nb: 1",
         "a: 1\n- b",
         "a:\n  - x\n  b: 1",
-        "a: |\n  text",
-        "a: >\n  text",
-        "a: &anchor value",
+        "a: |0\n  text",
+        "a: |x\n  text",
+        "a: |\n    leading\n  text",
+        "a: |\n\t\nb: 1",
+        "a: &x\n  &y value",
+        "a: *undefined",
+        "a: &x [*x]",
+        "a: &x\n  b: *x",
+        "[a, , b]",
+        "[a, b",
+        "{a: 1, a: 2}",
+        "key: [a,\nb]",
+        "[a\n: b]",
+        "[- a]",
+        "[a, |\n  b]",
+        "&a - x",
+        "a: &b[1]",
         "a: !!str value",
         "a: b: c",
         "a: \"x\" y",
@@ -452,9 +470,10 @@ class YamlCoreTest {
     @Test
     void writesAliasesInline() {
         YamlMapping mapping = new YamlMapping();
+        mapping.put("anchor", new YamlScalar("v", null, "shared", YamlScalarStyle.PLAIN));
         mapping.put("value", new YamlAlias("shared"));
-        mapping.put("list", sequence(new YamlAlias("item")));
-        assertEquals("value: *shared\nlist:\n  - *item", Yaml.stringify(mapping));
+        mapping.put("list", sequence(new YamlAlias("shared")));
+        assertEquals("anchor: &shared v\nvalue: *shared\nlist:\n  - *shared", Yaml.stringify(mapping));
     }
 
     @Test
@@ -487,9 +506,12 @@ class YamlCoreTest {
     }
 
     @Test
-    void rejectsTagsAndAnchorsOnWrite() {
+    void rejectsTagsAndUndefinedAliasesOnWrite() {
         assertThrows(YamlWriteException.class, () -> Yaml.stringify(new YamlScalar("v", "!custom", null, YamlScalarStyle.PLAIN)));
-        assertThrows(YamlWriteException.class, () -> Yaml.stringify(new YamlMapping(null, "anchor")));
+        assertThrows(YamlWriteException.class, () -> Yaml.stringify(sequence(new YamlAlias("missing"))));
+        YamlSequence aliasBeforeAnchor = sequence(new YamlAlias("a"), new YamlScalar("x", null, "a", YamlScalarStyle.PLAIN));
+        assertThrows(YamlWriteException.class, () -> Yaml.stringify(aliasBeforeAnchor));
+        assertThrows(YamlWriteException.class, () -> Yaml.stringify(new YamlScalar("v", null, "bad name", YamlScalarStyle.PLAIN)));
     }
 
     @Test
@@ -514,7 +536,7 @@ class YamlCoreTest {
 
     @Test
     void usesCommonExceptionBase() {
-        assertInstanceOf(YamlException.class, assertThrows(YamlParseException.class, () -> Yaml.parse("a: [1]")));
+        assertInstanceOf(YamlException.class, assertThrows(YamlParseException.class, () -> Yaml.parse("a: !tag 1")));
         assertTrue(YamlException.class.isAssignableFrom(YamlWriteException.class));
     }
 

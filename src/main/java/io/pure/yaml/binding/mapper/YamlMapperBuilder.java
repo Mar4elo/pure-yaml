@@ -11,6 +11,7 @@ public final class YamlMapperBuilder {
     private YamlInclude.Include defaultInclusion = YamlInclude.Include.ALWAYS;
     private YamlProcessingLimits processingLimits = YamlProcessingLimits.defaults();
     private boolean coerceQuotedScalars = true;
+    private boolean resolveAliases;
 
     public YamlMapperBuilder writeNulls(boolean writeNulls) {
         this.writeNulls = writeNulls;
@@ -41,13 +42,24 @@ public final class YamlMapperBuilder {
         return this;
     }
 
+    /**
+     * Whether aliases ({@code *name}) are read as the anchored node they refer to. Disabled by default;
+     * when enabled, the number of nodes read through aliases is bounded by
+     * {@link YamlProcessingLimits#maxAliasExpansion()} and the nesting depth by {@link YamlProcessingLimits#maxDepth()}.
+     */
+    public YamlMapperBuilder resolveAliases(boolean resolveAliases) {
+        this.resolveAliases = resolveAliases;
+        return this;
+    }
+
     public YamlMapper build() {
         return new YamlMapper(new YamlMapperConfig(
             writeNulls,
             failOnUnknownProperties,
             defaultInclusion,
             processingLimits,
-            coerceQuotedScalars
+            coerceQuotedScalars,
+            resolveAliases
         ));
     }
 }

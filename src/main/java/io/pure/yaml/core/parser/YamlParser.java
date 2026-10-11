@@ -1,8 +1,13 @@
 package io.pure.yaml.core.parser;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import io.pure.yaml.core.model.YamlAlias;
 import io.pure.yaml.core.model.YamlDocument;
@@ -18,11 +23,15 @@ import io.pure.yaml.core.model.YamlStream;
  * each of which starts from the beginning of the text; instances are not thread-safe.
  */
 public final class YamlParser {
+    private static final String FLOW_INDICATORS = ",[]{}";
+
     private final String text;
     private final YamlProcessingLimits limits;
     private List<Line> lines;
     private int index;
     private int aliasCount;
+    private Map<String, YamlNode> anchors;
+    private Set<YamlNode> openNodes;
 
     public YamlParser(String text, YamlProcessingLimits limits) {
         Objects.requireNonNull(text, "text");
@@ -41,7 +50,7 @@ public final class YamlParser {
     public YamlDocument parse() {
         reset();
         if (!skipToDocument()) {
-            return new YamlDocument(emptyNode());
+            return new YamlDocument(emptyNode(null));
         }
         YamlDocument document = parseDocument();
         if (skipToDocument()) {
@@ -97,6 +106,9 @@ public final class YamlParser {
     }
 
     private YamlDocument parseDocument() {
+        // Anchors are scoped to a document (YAML 1.2.2, 9.2; RFC 9512, 3.2).
+        anchors = new HashMap<>();
+        openNodes = Collections.newSetFromMap(new IdentityHashMap<>());
         String versionDirective = parseDirectives();
         skipIgnorable();
         YamlNode root;
@@ -105,7 +117,7 @@ public final class YamlParser {
         } else if (versionDirective != null) {
             throw new YamlParseException("Directives must be followed by a document start marker '---'");
         } else {
-            root = parseBlockValue(-1, 0, false);
+            root = parseBlockValue(-1, 0, false, null);
         }
         skipIgnorable();
         if (index < lines.size()) {
@@ -129,15 +141,15 @@ public final class YamlParser {
         String rest = content.substring(offset);
         if (rest.isEmpty() || rest.startsWith("#")) {
             index++;
-            return parseBlockValue(-1, 0, false);
+            return parseBlockValue(-1, 0, false, null);
         }
-        // "--- value": the root node starts on the marker line; only scalars may start there.
+        // "--- value": the root node starts on the marker line; block collections cannot start there.
         if (isSequenceEntry(rest) || findKeySeparator(rest) >= 0) {
             throw new YamlParseException("Block collections cannot start on the document start line at line " + marker.lineNumber());
         }
-        Line root = new Line(marker.lineNumber(), offset, rest, false, false, marker.trailing());
+        Line root = new Line(marker.lineNumber(), offset, rest, false, false, marker.trailing(), marker.raw());
         lines.set(index, root);
-        return parseNodeAt(root, -1, 0);
+        return parseNodeAt(root, -1, 0, null, false);
     }
 
     private String parseDirectives() {
@@ -169,31 +181,38 @@ public final class YamlParser {
         }
     }
 
-    private YamlNode parseBlockValue(int parentIndent, int depth, boolean allowCompactSequence) {
+    /**
+     * Parses a node that starts on a following line, or returns an empty node.
+     *
+     * @param anchor anchor given on a preceding line, or {@code null}
+     */
+    private YamlNode parseBlockValue(int parentIndent, int depth, boolean allowCompactSequence, String anchor) {
         skipIgnorable();
         if (index >= lines.size()) {
-            return emptyNode();
+            return emptyNode(anchor);
         }
         Line line = current();
         if (isDocumentMarker(line)) {
-            return emptyNode();
+            return emptyNode(anchor);
         }
         if (line.indent() > parentIndent) {
-            return parseNodeAt(line, parentIndent, depth);
+            return parseNodeAt(line, parentIndent, depth, anchor, allowCompactSequence);
         }
         if (allowCompactSequence && line.indent() == parentIndent && isSequenceEntry(line.content())) {
-            return parseSequence(parentIndent, depth + 1);
+            return parseSequence(parentIndent, depth + 1, anchor);
         }
-        return emptyNode();
+        return emptyNode(anchor);
     }
 
     /**
      * Parses the node that starts on {@code line}.
      *
-     * @param parentIndent indentation of the enclosing collection; continuation lines of a
-     *                     multi-line scalar must be indented further than this
+     * @param parentIndent         indentation of the enclosing collection; continuation lines of a
+     *                             multi-line node must be indented further than this
+     * @param allowCompactSequence whether a node given only by properties on this line may be a
+     *                             sequence at {@code parentIndent} (the value of a block mapping)
      */
-    private YamlNode parseNodeAt(Line line, int parentIndent, int depth) {
+    private YamlNode parseNodeAt(Line line, int parentIndent, int depth, String anchor, boolean allowCompactSequence) {
         String content = line.content();
         boolean sequence = isSequenceEntry(content);
         boolean mapping = !sequence && findKeySeparator(content) >= 0;
@@ -201,102 +220,111 @@ public final class YamlParser {
             throw tabIndentation(line);
         }
         if (sequence) {
-            return parseSequence(line.indent(), depth + 1);
+            return parseSequence(line.indent(), depth + 1, anchor);
         }
         if (mapping) {
-            return parseMapping(line.indent(), depth + 1);
+            return parseMapping(line.indent(), depth + 1, anchor);
         }
         index++;
-        return parseInlineValue(content, line.trailing(), line.lineNumber(), parentIndent, false);
+        Context context = allowCompactSequence ? Context.VALUE : Context.NODE;
+        return parseInlineValue(content, line.trailing(), line.lineNumber(), parentIndent, depth, context, anchor);
     }
 
-    private YamlSequence parseSequence(int indent, int depth) {
+    private YamlSequence parseSequence(int indent, int depth, String anchor) {
         ensureDepth(depth);
-        YamlSequence sequence = new YamlSequence();
-        while (true) {
-            skipIgnorable();
-            if (index >= lines.size()) {
-                break;
+        YamlSequence sequence = new YamlSequence(null, anchor);
+        open(anchor, sequence);
+        try {
+            while (true) {
+                skipIgnorable();
+                if (index >= lines.size()) {
+                    return sequence;
+                }
+                Line line = current();
+                if (line.indent() < indent || isDocumentMarker(line)) {
+                    return sequence;
+                }
+                if (line.indent() > indent) {
+                    throw invalidIndentation(line);
+                }
+                if (line.leadingTab()) {
+                    throw tabIndentation(line);
+                }
+                String content = line.content();
+                if (!isSequenceEntry(content)) {
+                    return sequence;
+                }
+                int offset = 1;
+                boolean tabSeparated = false;
+                while (offset < content.length() && isBlank(content.charAt(offset))) {
+                    tabSeparated |= content.charAt(offset) == '\t';
+                    offset++;
+                }
+                String rest = content.substring(offset);
+                if (rest.isEmpty() || rest.startsWith("#")) {
+                    index++;
+                    sequence.add(parseBlockValue(indent, depth, false, null));
+                } else {
+                    // Re-read the entry content as if it started its own line at the column after "- ".
+                    // A tab in the separator cannot serve as indentation of a nested block collection.
+                    Line item = new Line(line.lineNumber(), indent + offset, rest, tabSeparated, false, line.trailing(), line.raw());
+                    lines.set(index, item);
+                    sequence.add(parseNodeAt(item, indent, depth, null, false));
+                }
             }
-            Line line = current();
-            if (line.indent() < indent || isDocumentMarker(line)) {
-                break;
-            }
-            if (line.indent() > indent) {
-                throw invalidIndentation(line);
-            }
-            if (line.leadingTab()) {
-                throw tabIndentation(line);
-            }
-            String content = line.content();
-            if (!isSequenceEntry(content)) {
-                break;
-            }
-            int offset = 1;
-            boolean tabSeparated = false;
-            while (offset < content.length() && isBlank(content.charAt(offset))) {
-                tabSeparated |= content.charAt(offset) == '\t';
-                offset++;
-            }
-            String rest = content.substring(offset);
-            if (rest.isEmpty() || rest.startsWith("#")) {
+        } finally {
+            close(sequence);
+        }
+    }
+
+    private YamlMapping parseMapping(int indent, int depth, String anchor) {
+        ensureDepth(depth);
+        YamlMapping mapping = new YamlMapping(null, anchor);
+        open(anchor, mapping);
+        try {
+            while (true) {
+                skipIgnorable();
+                if (index >= lines.size()) {
+                    return mapping;
+                }
+                Line line = current();
+                if (line.indent() < indent || isDocumentMarker(line)) {
+                    return mapping;
+                }
+                if (line.indent() > indent) {
+                    throw invalidIndentation(line);
+                }
+                if (line.leadingTab()) {
+                    throw tabIndentation(line);
+                }
+                String content = line.content();
+                if (isSequenceEntry(content)) {
+                    throw new YamlParseException("Sequence entry is not allowed inside a mapping at line " + line.lineNumber());
+                }
+                if (isIndicatorWithBlank(content, '?')) {
+                    throw new YamlParseException("Complex mapping keys are not supported at line " + line.lineNumber());
+                }
+                int separator = findKeySeparator(content);
+                if (separator < 0) {
+                    throw new YamlParseException("Expected a mapping entry at line " + line.lineNumber());
+                }
                 index++;
-                sequence.add(parseBlockValue(indent, depth, false));
-            } else {
-                // Re-read the entry content as if it started its own line at the column after "- ".
-                // A tab in the separator cannot serve as indentation of a nested block collection.
-                Line item = new Line(line.lineNumber(), indent + offset, rest, tabSeparated, false, line.trailing());
-                lines.set(index, item);
-                sequence.add(parseNodeAt(item, indent, depth));
+                YamlNode key = parseKey(content.substring(0, separator), line.lineNumber(), depth);
+                if (mapping.containsKey(keyText(key))) {
+                    throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + line.lineNumber());
+                }
+                String rawValue = trim(content.substring(separator + 1));
+                YamlNode value = rawValue.isEmpty() || rawValue.startsWith("#")
+                    ? parseBlockValue(indent, depth, true, null)
+                    : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, depth, Context.VALUE, null);
+                mapping.put(key, value);
             }
+        } finally {
+            close(mapping);
         }
-        return sequence;
     }
 
-    private YamlMapping parseMapping(int indent, int depth) {
-        ensureDepth(depth);
-        YamlMapping mapping = new YamlMapping();
-        while (true) {
-            skipIgnorable();
-            if (index >= lines.size()) {
-                break;
-            }
-            Line line = current();
-            if (line.indent() < indent || isDocumentMarker(line)) {
-                break;
-            }
-            if (line.indent() > indent) {
-                throw invalidIndentation(line);
-            }
-            if (line.leadingTab()) {
-                throw tabIndentation(line);
-            }
-            String content = line.content();
-            if (isSequenceEntry(content)) {
-                throw new YamlParseException("Sequence entry is not allowed inside a mapping at line " + line.lineNumber());
-            }
-            if (isIndicatorWithBlank(content, '?')) {
-                throw new YamlParseException("Complex mapping keys are not supported at line " + line.lineNumber());
-            }
-            int separator = findKeySeparator(content);
-            if (separator < 0) {
-                throw new YamlParseException("Expected a mapping entry at line " + line.lineNumber());
-            }
-            index++;
-            YamlScalar key = parseKey(content.substring(0, separator), line.lineNumber());
-            if (mapping.containsKey(key.value())) {
-                throw new YamlParseException("Duplicate mapping key '" + key.value() + "' at line " + line.lineNumber());
-            }
-            String rawValue = trim(content.substring(separator + 1));
-            YamlNode value = rawValue.isEmpty() || rawValue.startsWith("#")
-                ? parseBlockValue(indent, depth, true)
-                : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, false);
-            mapping.put(key, value);
-        }
-        return mapping;
-    }
-
-    private YamlScalar parseKey(String rawKey, int lineNumber) {
+    private YamlNode parseKey(String rawKey, int lineNumber, int depth) {
         String key = trim(rawKey);
         if (key.isEmpty()) {
             throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
@@ -304,56 +332,88 @@ public final class YamlParser {
         if (isIndicatorWithBlank(key, '?')) {
             throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
         }
-        if (key.charAt(0) == '*') {
-            throw new YamlParseException("Alias mapping keys are not supported at line " + lineNumber);
-        }
-        if (!(parseInlineValue(key, "", lineNumber, -1, true) instanceof YamlScalar scalar)) {
-            throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
-        }
-        return scalar;
+        return checkScalarKey(parseInlineValue(key, "", lineNumber, -1, depth, Context.KEY, null), lineNumber);
     }
 
     /**
      * Parses a node written on the current line. The line itself has already been consumed;
-     * multi-line scalars continue on the following lines, which must be indented further than
+     * multi-line nodes continue on the following lines, which must be indented further than
      * {@code parentIndent}. Implicit keys are always single-line.
+     *
+     * @param outerAnchor anchor given on a preceding line, or {@code null}
      */
-    private YamlNode parseInlineValue(String raw, String trailing, int lineNumber, int parentIndent, boolean key) {
-        char first = raw.charAt(0);
-        if (first == '"' || first == '\'') {
-            return parseQuoted(raw, trailing, lineNumber, parentIndent, key);
+    private YamlNode parseInlineValue(
+        String raw,
+        String trailing,
+        int lineNumber,
+        int parentIndent,
+        int depth,
+        Context context,
+        String outerAnchor
+    ) {
+        Properties properties = readProperties(raw, 0, lineNumber, false);
+        if (properties.anchor() != null && outerAnchor != null) {
+            throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
         }
-        int commentStart = findCommentStart(raw);
-        String text = trim(commentStart < 0 ? raw : raw.substring(0, commentStart));
+        String anchor = properties.anchor() != null ? properties.anchor() : outerAnchor;
+        String text = raw.substring(properties.end());
+        if (text.isEmpty() || text.startsWith("#")) {
+            if (context == Context.KEY) {
+                throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
+            }
+            // Only properties on this line: the node itself starts on the next line.
+            return parseBlockValue(parentIndent, depth, context == Context.VALUE, anchor);
+        }
+        char first = text.charAt(0);
         switch (first) {
+            case '"', '\'' -> {
+                Quoted quoted = readQuoted(text + trailing, 0, lineNumber, parentIndent, context != Context.KEY);
+                ensureOnlyComment(quoted.lineText().substring(quoted.end()), quoted.lineNumber());
+                return register(new YamlScalar(quoted.value(), null, anchor, quoted.style()));
+            }
             case '*' -> {
-                return parseAlias(text, lineNumber);
+                if (anchor != null) {
+                    throw new YamlParseException("An alias cannot have an anchor at line " + lineNumber);
+                }
+                return parseAlias(stripComment(text), lineNumber);
             }
             case '[', '{' -> {
-                return parseFlowCollection(text, lineNumber);
+                if (context == Context.KEY) {
+                    throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
+                }
+                FlowParser flow = new FlowParser(text + trailing, lineNumber, parentIndent);
+                YamlNode node = flow.parseCollection(depth, anchor);
+                ensureOnlyComment(flow.remainder(), flow.lineNumber());
+                return node;
             }
-            case '&' -> throw new YamlParseException("Anchors are not supported at line " + lineNumber);
-            case '!' -> throw new YamlParseException("Tags are not supported at line " + lineNumber);
-            case '|', '>' -> throw new YamlParseException("Block scalars ('|', '>') are not supported at line " + lineNumber);
+            case '|', '>' -> {
+                if (context == Context.KEY) {
+                    throw new YamlParseException("Block scalars cannot be mapping keys at line " + lineNumber);
+                }
+                return parseBlockScalar(text, lineNumber, parentIndent, anchor);
+            }
             case ']', '}', ',', '%', '@', '`' ->
                 throw new YamlParseException("Plain scalar cannot start with '" + first + "' at line " + lineNumber);
             default -> {
             }
         }
-        if (isSequenceEntry(text)) {
+        int commentStart = findCommentStart(text);
+        String plain = trim(commentStart < 0 ? text : text.substring(0, commentStart));
+        if (isSequenceEntry(plain)) {
             throw new YamlParseException("Sequence entry is not allowed on a mapping value line at line " + lineNumber);
         }
-        if (isIndicatorWithBlank(text, '?')) {
+        if (isIndicatorWithBlank(plain, '?')) {
             throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
         }
-        if (key) {
-            return YamlScalar.plain(text);
+        if (context == Context.KEY) {
+            return register(new YamlScalar(plain, null, anchor, YamlScalarStyle.PLAIN));
         }
-        if (hasMappingIndicator(text)) {
+        if (hasMappingIndicator(plain)) {
             throw new YamlParseException("Mapping values are not allowed here at line " + lineNumber + ", quote the value");
         }
         // A comment ends a plain scalar, so it cannot continue on the next line.
-        return YamlScalar.plain(commentStart < 0 ? readPlainContinuation(text, parentIndent) : text);
+        String value = commentStart < 0 ? readPlainContinuation(plain, parentIndent) : plain;
+        return register(new YamlScalar(value, null, anchor, YamlScalarStyle.PLAIN));
     }
 
     /**
@@ -396,21 +456,24 @@ public final class YamlParser {
         return value == null ? firstLine : value.toString();
     }
 
-    private YamlScalar parseQuoted(String raw, String trailing, int lineNumber, int parentIndent, boolean key) {
-        boolean doubleQuoted = raw.charAt(0) == '"';
+    /**
+     * Reads a quoted scalar whose opening quote is at {@code start} in {@code firstText}. Positions are
+     * offsets rather than substrings, so that long single-line flow collections are read in linear time.
+     */
+    private Quoted readQuoted(String firstText, int start, int lineNumber, int parentIndent, boolean multiLine) {
+        boolean doubleQuoted = firstText.charAt(start) == '"';
         YamlScalarStyle style = doubleQuoted ? YamlScalarStyle.DOUBLE_QUOTED : YamlScalarStyle.SINGLE_QUOTED;
-        int end = findQuoteEnd(raw, 1, doubleQuoted);
+        int end = findQuoteEnd(firstText, start + 1, doubleQuoted);
         if (end >= 0) {
-            ensureOnlyComment(raw.substring(end + 1), lineNumber);
-            String body = raw.substring(1, end);
+            String body = firstText.substring(start + 1, end);
             String value = doubleQuoted ? unescape(body, lineNumber) : body.replace("''", "'");
-            return new YamlScalar(value, null, null, style);
+            return new Quoted(value, style, firstText, end + 1, lineNumber);
         }
-        if (key) {
+        if (!multiLine) {
             throw unterminatedQuote(doubleQuoted, lineNumber);
         }
         List<Segment> segments = new ArrayList<>();
-        segments.add(new Segment(raw.substring(1) + trailing, lineNumber));
+        segments.add(new Segment(firstText.substring(start + 1), lineNumber));
         while (true) {
             if (index >= lines.size()) {
                 throw unterminatedQuote(doubleQuoted, lineNumber);
@@ -426,9 +489,8 @@ public final class YamlParser {
             String segment = line.content() + line.trailing();
             end = findQuoteEnd(segment, 0, doubleQuoted);
             if (end >= 0) {
-                ensureOnlyComment(segment.substring(end + 1), line.lineNumber());
                 segments.add(new Segment(segment.substring(0, end), line.lineNumber()));
-                return new YamlScalar(foldQuoted(segments, doubleQuoted), null, null, style);
+                return new Quoted(foldQuoted(segments, doubleQuoted), style, segment, end + 1, line.lineNumber());
             }
             segments.add(new Segment(segment, line.lineNumber()));
         }
@@ -468,6 +530,135 @@ public final class YamlParser {
         return result.toString();
     }
 
+    /**
+     * Reads a literal ({@code |}) or folded ({@code >}) block scalar (YAML 1.2.2, 8.1).
+     */
+    private YamlScalar parseBlockScalar(String header, int lineNumber, int parentIndent, String anchor) {
+        boolean literal = header.charAt(0) == '|';
+        int indentation = 0;
+        char chomping = 0;
+        int position = 1;
+        while (position < header.length() && position <= 2) {
+            char ch = header.charAt(position);
+            if (ch >= '1' && ch <= '9' && indentation == 0) {
+                indentation = ch - '0';
+            } else if ((ch == '+' || ch == '-') && chomping == 0) {
+                chomping = ch;
+            } else {
+                break;
+            }
+            position++;
+        }
+        String rest = header.substring(position);
+        if (!rest.isEmpty() && !(isBlank(rest.charAt(0)) && (trim(rest).isEmpty() || trim(rest).startsWith("#")))) {
+            throw new YamlParseException("Invalid block scalar header at line " + lineNumber + ": " + header);
+        }
+
+        int contentIndent = indentation > 0 ? Math.max(parentIndent, 0) + indentation : -1;
+        int leadingEmptySpaces = 0;
+        // Empty lines are null; the end of the input ends the last line like a line break does.
+        List<String> entries = new ArrayList<>();
+        while (index < lines.size()) {
+            Line line = current();
+            String raw = line.raw();
+            int spaces = line.indent();
+            boolean spacesOnly = spaces == raw.length();
+            if (contentIndent < 0) {
+                if (spacesOnly) {
+                    leadingEmptySpaces = Math.max(leadingEmptySpaces, spaces);
+                    entries.add(null);
+                    index++;
+                    continue;
+                }
+                if (spaces <= parentIndent || isDocumentMarker(line)) {
+                    ensureNotTabIndented(raw, line.lineNumber());
+                    break;
+                }
+                contentIndent = spaces;
+                if (leadingEmptySpaces > contentIndent) {
+                    throw new YamlParseException(
+                        "Leading empty line of a block scalar is indented more than its content at line " + line.lineNumber()
+                    );
+                }
+            }
+            if (spacesOnly) {
+                // Lines of spaces that are indented further than the content are content themselves.
+                entries.add(spaces > contentIndent ? raw.substring(contentIndent) : null);
+                index++;
+                continue;
+            }
+            if (spaces < contentIndent || isDocumentMarker(line)) {
+                ensureNotTabIndented(raw, line.lineNumber());
+                break;
+            }
+            entries.add(raw.substring(contentIndent));
+            index++;
+        }
+
+        int lastContent = -1;
+        for (int i = 0; i < entries.size(); i++) {
+            if (entries.get(i) != null) {
+                lastContent = i;
+            }
+        }
+        int trailingEmptyLines = entries.size() - lastContent - 1;
+        String lastBreak = lastContent >= 0 ? "\n" : "";
+        String body = literal ? literalBody(entries, lastContent) : foldedBody(entries, lastContent);
+        String value = switch (chomping) {
+            case '-' -> body;
+            case '+' -> body + lastBreak + "\n".repeat(trailingEmptyLines);
+            default -> body + lastBreak;
+        };
+        YamlScalarStyle style = literal ? YamlScalarStyle.LITERAL : YamlScalarStyle.FOLDED;
+        return register(new YamlScalar(value, null, anchor, style));
+    }
+
+    private static void ensureNotTabIndented(String raw, int lineNumber) {
+        if (!raw.isEmpty() && trim(raw).isEmpty()) {
+            throw new YamlParseException("Tabs are not supported for indentation at line " + lineNumber);
+        }
+    }
+
+    private static String literalBody(List<String> entries, int lastContent) {
+        StringBuilder body = new StringBuilder();
+        for (int i = 0; i <= lastContent; i++) {
+            if (i > 0) {
+                body.append('\n');
+            }
+            body.append(entries.get(i) == null ? "" : entries.get(i));
+        }
+        return body.toString();
+    }
+
+    /**
+     * Folds lines that start with a non-space character; line breaks around more-indented
+     * lines and empty lines are kept (YAML 1.2.2, 8.1.3).
+     */
+    private static String foldedBody(List<String> entries, int lastContent) {
+        StringBuilder body = new StringBuilder();
+        Boolean previousSpaced = null;
+        int emptyLines = 0;
+        for (int i = 0; i <= lastContent; i++) {
+            String text = entries.get(i);
+            if (text == null) {
+                emptyLines++;
+                continue;
+            }
+            boolean spaced = isBlank(text.charAt(0));
+            if (previousSpaced == null) {
+                body.append("\n".repeat(emptyLines));
+            } else if (!previousSpaced && !spaced) {
+                body.append(emptyLines == 0 ? " " : "\n".repeat(emptyLines));
+            } else {
+                body.append("\n".repeat(emptyLines + 1));
+            }
+            body.append(text);
+            emptyLines = 0;
+            previousSpaced = spaced;
+        }
+        return body.toString();
+    }
+
     private static boolean endsWithEscapedLineBreak(String text) {
         return !text.isEmpty() && text.charAt(text.length() - 1) == '\\' && !isEscaped(text, text.length() - 1);
     }
@@ -494,7 +685,7 @@ public final class YamlParser {
     private static void ensureOnlyComment(String trailing, int lineNumber) {
         String rest = trim(trailing);
         if (!rest.isEmpty() && !(isBlank(trailing.charAt(0)) && rest.startsWith("#"))) {
-            throw new YamlParseException("Unexpected content after quoted scalar at line " + lineNumber);
+            throw new YamlParseException("Unexpected content after the node at line " + lineNumber);
         }
     }
 
@@ -502,26 +693,97 @@ public final class YamlParser {
         return new YamlParseException("Unterminated " + (doubleQuoted ? "double" : "single") + "-quoted scalar at line " + lineNumber);
     }
 
+    /**
+     * Reads node properties at the start of {@code text}: an anchor ({@code &name}); tags are not supported.
+     */
+    private static Properties readProperties(String text, int from, int lineNumber, boolean flow) {
+        String anchor = null;
+        int position = from;
+        while (position < text.length()) {
+            char ch = text.charAt(position);
+            if (ch == '!') {
+                throw new YamlParseException("Tags are not supported at line " + lineNumber);
+            }
+            if (ch != '&') {
+                break;
+            }
+            if (anchor != null) {
+                throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
+            }
+            int start = ++position;
+            while (position < text.length() && isAnchorChar(text.charAt(position))) {
+                position++;
+            }
+            anchor = text.substring(start, position);
+            if (anchor.isEmpty()) {
+                throw new YamlParseException("Anchor name expected at line " + lineNumber);
+            }
+            if (position < text.length() && !isBlank(text.charAt(position)) && !flow) {
+                throw new YamlParseException("Anchor must be followed by white space at line " + lineNumber);
+            }
+            while (position < text.length() && isBlank(text.charAt(position))) {
+                position++;
+            }
+        }
+        return new Properties(anchor, position);
+    }
+
     private YamlAlias parseAlias(String text, int lineNumber) {
         String name = text.substring(1);
-        if (name.isEmpty() || name.chars().anyMatch(ch -> Character.isWhitespace(ch) || ",[]{}".indexOf(ch) >= 0)) {
+        if (name.isEmpty() || !name.chars().allMatch(ch -> isAnchorChar((char) ch))) {
             throw new YamlParseException("Invalid alias at line " + lineNumber + ": " + text);
         }
+        return resolveAlias(name, lineNumber);
+    }
+
+    private YamlAlias resolveAlias(String name, int lineNumber) {
         aliasCount++;
         if (aliasCount > limits.maxAliases()) {
             throw new YamlParseException("Alias limit exceeded at line " + lineNumber);
         }
-        return new YamlAlias(name);
+        YamlNode target = anchors.get(name);
+        if (target == null) {
+            throw new YamlParseException("Undefined alias '*" + name + "' at line " + lineNumber);
+        }
+        if (openNodes.contains(target)) {
+            throw new YamlParseException("Recursive alias '*" + name + "' at line " + lineNumber);
+        }
+        return new YamlAlias(name, target);
     }
 
-    private YamlNode parseFlowCollection(String text, int lineNumber) {
-        if (text.matches("\\[[ \t]*]")) {
-            return new YamlSequence();
+    private static YamlNode checkScalarKey(YamlNode key, int lineNumber) {
+        YamlNode scalar = key instanceof YamlAlias alias ? alias.target() : key;
+        if (!(scalar instanceof YamlScalar value) || value.value() == null) {
+            throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
         }
-        if (text.matches("\\{[ \t]*}")) {
-            return new YamlMapping();
+        return key;
+    }
+
+    private static String keyText(YamlNode key) {
+        YamlNode scalar = key instanceof YamlAlias alias ? alias.target() : key;
+        return ((YamlScalar) scalar).value();
+    }
+
+    private void open(String anchor, YamlNode node) {
+        if (anchor != null) {
+            anchors.put(anchor, node);
+            openNodes.add(node);
         }
-        throw new YamlParseException("Flow collections are not supported (only empty [] and {}) at line " + lineNumber);
+    }
+
+    private void close(YamlNode node) {
+        openNodes.remove(node);
+    }
+
+    private <T extends YamlNode> T register(T node) {
+        if (node.anchor() != null) {
+            anchors.put(node.anchor(), node);
+        }
+        return node;
+    }
+
+    private YamlScalar emptyNode(String anchor) {
+        return register(new YamlScalar(null, null, anchor, YamlScalarStyle.PLAIN));
     }
 
     private String unescape(String body, int lineNumber) {
@@ -624,10 +886,6 @@ public final class YamlParser {
         return new YamlParseException("Tabs are not supported for indentation at line " + line.lineNumber());
     }
 
-    private static YamlScalar emptyNode() {
-        return YamlScalar.plain(null);
-    }
-
     private static boolean isDocumentMarker(Line line) {
         return isDocumentStart(line) || isDocumentEnd(line);
     }
@@ -658,28 +916,84 @@ public final class YamlParser {
             && (content.length() == 1 || isBlank(content.charAt(1)));
     }
 
+    /**
+     * Finds the {@code :} that separates an implicit key on this line from its value, or -1.
+     * Node properties before the key are skipped; quoted, alias and flow keys end where their syntax ends.
+     */
     private static int findKeySeparator(String content) {
-        if (content.isEmpty()) {
+        int position = 0;
+        while (position < content.length() && (content.charAt(position) == '&' || content.charAt(position) == '!')) {
+            while (position < content.length() && !isBlank(content.charAt(position))) {
+                position++;
+            }
+            while (position < content.length() && isBlank(content.charAt(position))) {
+                position++;
+            }
+        }
+        if (position >= content.length()) {
             return -1;
         }
-        char first = content.charAt(0);
+        char first = content.charAt(position);
+        int keyEnd;
         if (first == '"' || first == '\'') {
-            int end = findQuoteEnd(content, 1, first == '"');
-            if (end < 0) {
+            int close = findQuoteEnd(content, position + 1, first == '"');
+            if (close < 0) {
                 return -1;
             }
-            int i = end + 1;
-            while (i < content.length() && isBlank(content.charAt(i))) {
-                i++;
+            keyEnd = close + 1;
+        } else if (first == '*') {
+            keyEnd = position + 1;
+            while (keyEnd < content.length() && isAnchorChar(content.charAt(keyEnd))) {
+                keyEnd++;
             }
-            return isMappingIndicatorAt(content, i) ? i : -1;
+        } else if (first == '[' || first == '{') {
+            int close = findFlowEnd(content, position);
+            if (close < 0) {
+                return -1;
+            }
+            keyEnd = close + 1;
+        } else {
+            for (int i = position; i < content.length(); i++) {
+                if (content.charAt(i) == '#' && i > 0 && isBlank(content.charAt(i - 1))) {
+                    return -1;
+                }
+                if (isMappingIndicatorAt(content, i)) {
+                    return i;
+                }
+            }
+            return -1;
         }
-        for (int i = 0; i < content.length(); i++) {
-            if (content.charAt(i) == '#' && i > 0 && isBlank(content.charAt(i - 1))) {
+        while (keyEnd < content.length() && isBlank(content.charAt(keyEnd))) {
+            keyEnd++;
+        }
+        return isMappingIndicatorAt(content, keyEnd) ? keyEnd : -1;
+    }
+
+    /**
+     * Finds the bracket that closes the flow collection starting at {@code start} on the same line, or -1.
+     */
+    private static int findFlowEnd(String content, int start) {
+        int depth = 0;
+        char previous = ' ';
+        for (int i = start; i < content.length(); i++) {
+            char ch = content.charAt(i);
+            if ((ch == '"' || ch == '\'') && "[{,:".indexOf(previous) >= 0) {
+                int close = findQuoteEnd(content, i + 1, ch == '"');
+                if (close < 0) {
+                    return -1;
+                }
+                i = close;
+            } else if (ch == '[' || ch == '{') {
+                depth++;
+            } else if (ch == ']' || ch == '}') {
+                if (--depth == 0) {
+                    return i;
+                }
+            } else if (ch == '#' && isBlank(content.charAt(i - 1))) {
                 return -1;
             }
-            if (isMappingIndicatorAt(content, i)) {
-                return i;
+            if (!isBlank(ch)) {
+                previous = ch;
             }
         }
         return -1;
@@ -756,18 +1070,26 @@ public final class YamlParser {
         return ch == ' ' || ch == '\t';
     }
 
+    private static boolean isAnchorChar(char ch) {
+        return !isBlank(ch) && FLOW_INDICATORS.indexOf(ch) < 0;
+    }
+
     private static List<Line> tokenize(String text) {
         List<Line> result = new ArrayList<>();
         int lineNumber = 1;
         int lineStart = 0;
-        for (int i = 0; i <= text.length(); i++) {
-            if (i == text.length() || text.charAt(i) == '\n' || text.charAt(i) == '\r') {
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n' || text.charAt(i) == '\r') {
                 result.add(parseLine(text.substring(lineStart, i), lineNumber++));
-                if (i < text.length() && text.charAt(i) == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') {
+                if (text.charAt(i) == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') {
                     i++;
                 }
                 lineStart = i + 1;
             }
+        }
+        // A final line break ends the last line; it does not start an empty one.
+        if (lineStart < text.length()) {
+            result.add(parseLine(text.substring(lineStart), lineNumber));
         }
         return result;
     }
@@ -792,7 +1114,7 @@ public final class YamlParser {
             end--;
         }
         String content = line.substring(start, end);
-        return new Line(lineNumber, indent, content, leadingTab && !content.isEmpty(), bom, line.substring(end));
+        return new Line(lineNumber, indent, content, leadingTab && !content.isEmpty(), bom, line.substring(end), line);
     }
 
     /**
@@ -818,6 +1140,330 @@ public final class YamlParser {
     }
 
     /**
+     * Reads a flow collection ({@code [...]} or {@code {...}}), which may span several lines
+     * (YAML 1.2.2, 7.4 and 7.5).
+     */
+    private final class FlowParser {
+        private final int parentIndent;
+        private final int startLine;
+        private String text;
+        private int position;
+        private int lineNumber;
+
+        FlowParser(String text, int lineNumber, int parentIndent) {
+            this.text = text;
+            this.lineNumber = lineNumber;
+            this.startLine = lineNumber;
+            this.parentIndent = parentIndent;
+        }
+
+        String remainder() {
+            return text.substring(position);
+        }
+
+        int lineNumber() {
+            return lineNumber;
+        }
+
+        YamlNode parseCollection(int depth, String anchor) {
+            return text.charAt(position) == '[' ? parseFlowSequence(depth + 1, anchor) : parseFlowMapping(depth + 1, anchor);
+        }
+
+        private YamlSequence parseFlowSequence(int depth, String anchor) {
+            ensureDepth(depth);
+            YamlSequence sequence = new YamlSequence(null, anchor);
+            open(anchor, sequence);
+            try {
+                position++;
+                while (true) {
+                    skipSeparation();
+                    if (peek() == ']') {
+                        position++;
+                        return sequence;
+                    }
+                    if (isIndicator('?')) {
+                        throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
+                    }
+                    if (isValueIndicator()) {
+                        throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
+                    }
+                    int entryLine = lineNumber;
+                    YamlNode entry = parseFlowNode(depth);
+                    boolean crossedLine = skipSeparation();
+                    if (isPairSeparator(entry)) {
+                        // A single-pair mapping such as [key: value]; its key must be on one line.
+                        if (crossedLine || lineNumber != entryLine) {
+                            throw new YamlParseException("Implicit keys must be on a single line at line " + lineNumber);
+                        }
+                        position++;
+                        ensureDepth(depth + 1);
+                        YamlMapping pair = new YamlMapping();
+                        YamlNode key = checkScalarKey(entry, lineNumber);
+                        skipSeparation();
+                        YamlNode value = peek() == ',' || peek() == ']' ? emptyNode(null) : parseFlowNode(depth + 1);
+                        pair.put(key, value);
+                        entry = pair;
+                        skipSeparation();
+                    }
+                    sequence.add(entry);
+                    if (!nextEntry(']')) {
+                        return sequence;
+                    }
+                }
+            } finally {
+                close(sequence);
+            }
+        }
+
+        private YamlMapping parseFlowMapping(int depth, String anchor) {
+            ensureDepth(depth);
+            YamlMapping mapping = new YamlMapping(null, anchor);
+            open(anchor, mapping);
+            try {
+                position++;
+                while (true) {
+                    skipSeparation();
+                    if (peek() == '}') {
+                        position++;
+                        return mapping;
+                    }
+                    if (isIndicator('?')) {
+                        throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
+                    }
+                    if (isValueIndicator()) {
+                        throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
+                    }
+                    int keyLine = lineNumber;
+                    YamlNode key = checkScalarKey(parseFlowNode(depth), keyLine);
+                    skipSeparation();
+                    YamlNode value;
+                    if (isPairSeparator(key)) {
+                        position++;
+                        skipSeparation();
+                        value = peek() == ',' || peek() == '}' ? emptyNode(null) : parseFlowNode(depth);
+                        skipSeparation();
+                    } else {
+                        value = emptyNode(null);
+                    }
+                    if (mapping.containsKey(keyText(key))) {
+                        throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + keyLine);
+                    }
+                    mapping.put(key, value);
+                    if (!nextEntry('}')) {
+                        return mapping;
+                    }
+                }
+            } finally {
+                close(mapping);
+            }
+        }
+
+        /**
+         * Consumes the separator after an entry.
+         *
+         * @return {@code true} when another entry may follow, {@code false} when the collection is closed
+         */
+        private boolean nextEntry(char close) {
+            char ch = peek();
+            if (ch == ',') {
+                position++;
+                return true;
+            }
+            if (ch == close) {
+                position++;
+                return false;
+            }
+            throw new YamlParseException("Expected ',' or '" + close + "' in flow collection at line " + lineNumber);
+        }
+
+        private YamlNode parseFlowNode(int depth) {
+            Properties properties = readProperties(text, position, lineNumber, true);
+            position = properties.end();
+            String anchor = properties.anchor();
+            if (anchor != null) {
+                skipSeparation();
+            }
+            char ch = peek();
+            if (ch == ',' || ch == ']' || ch == '}' || isValueIndicator()) {
+                if (anchor == null) {
+                    throw new YamlParseException("Missing flow collection entry at line " + lineNumber);
+                }
+                return emptyNode(anchor);
+            }
+            switch (ch) {
+                case '[' -> {
+                    return parseFlowSequence(depth + 1, anchor);
+                }
+                case '{' -> {
+                    return parseFlowMapping(depth + 1, anchor);
+                }
+                case '"', '\'' -> {
+                    Quoted quoted = readQuoted(text, position, lineNumber, parentIndent, true);
+                    if (quoted.lineNumber() == lineNumber) {
+                        position = quoted.end();
+                    } else {
+                        text = quoted.lineText();
+                        position = quoted.end();
+                        lineNumber = quoted.lineNumber();
+                    }
+                    return register(new YamlScalar(quoted.value(), null, anchor, quoted.style()));
+                }
+                case '*' -> {
+                    if (anchor != null) {
+                        throw new YamlParseException("An alias cannot have an anchor at line " + lineNumber);
+                    }
+                    int start = ++position;
+                    while (position < text.length() && isAnchorChar(text.charAt(position))) {
+                        position++;
+                    }
+                    if (position == start) {
+                        throw new YamlParseException("Alias name expected at line " + lineNumber);
+                    }
+                    return resolveAlias(text.substring(start, position), lineNumber);
+                }
+                case '|', '>' -> throw new YamlParseException("Block scalars are not allowed inside flow collections at line " + lineNumber);
+                case '#', '%', '@', '`' ->
+                    throw new YamlParseException("Plain scalar cannot start with '" + ch + "' at line " + lineNumber);
+                case '-', '?', ':' -> {
+                    if (!isPlainSafe(position + 1)) {
+                        throw new YamlParseException("Unexpected '" + ch + "' in flow collection at line " + lineNumber);
+                    }
+                }
+                default -> {
+                }
+            }
+            return register(new YamlScalar(readFlowPlain(), null, anchor, YamlScalarStyle.PLAIN));
+        }
+
+        /**
+         * Reads a plain scalar inside a flow collection; it may continue on following lines.
+         */
+        private String readFlowPlain() {
+            StringBuilder value = new StringBuilder();
+            while (true) {
+                int start = position;
+                boolean comment = false;
+                while (position < text.length()) {
+                    char ch = text.charAt(position);
+                    if (FLOW_INDICATORS.indexOf(ch) >= 0 || isValueIndicator()) {
+                        break;
+                    }
+                    if (ch == '#' && position > start && isBlank(text.charAt(position - 1))) {
+                        comment = true;
+                        break;
+                    }
+                    position++;
+                }
+                value.append(trim(text.substring(start, position)));
+                if (comment || position < text.length()) {
+                    return value.toString();
+                }
+                // The line ended inside the scalar: it continues if the next non-empty line starts with plain text.
+                int emptyLines = 0;
+                while (true) {
+                    advanceLine();
+                    if (!text.isEmpty()) {
+                        break;
+                    }
+                    emptyLines++;
+                }
+                char next = text.charAt(0);
+                if (next == '#' || FLOW_INDICATORS.indexOf(next) >= 0 || isValueIndicator()) {
+                    return value.toString();
+                }
+                value.append(emptyLines == 0 ? " " : "\n".repeat(emptyLines));
+            }
+        }
+
+        /**
+         * Skips white space, comments and line breaks.
+         *
+         * @return whether a line break was crossed
+         */
+        private boolean skipSeparation() {
+            boolean crossedLine = false;
+            while (true) {
+                while (position < text.length() && isBlank(text.charAt(position))) {
+                    position++;
+                }
+                if (position < text.length() && text.charAt(position) == '#'
+                    && (position == 0 || isBlank(text.charAt(position - 1)))) {
+                    position = text.length();
+                }
+                if (position < text.length()) {
+                    return crossedLine;
+                }
+                advanceLine();
+                crossedLine = true;
+            }
+        }
+
+        private void advanceLine() {
+            if (index >= lines.size()) {
+                throw new YamlParseException("Unterminated flow collection starting at line " + startLine);
+            }
+            Line line = current();
+            if (isDocumentMarker(line)) {
+                throw new YamlParseException("Document marker inside a flow collection at line " + line.lineNumber());
+            }
+            if (!line.ignorable() && line.indent() <= parentIndent) {
+                throw new YamlParseException("Invalid indentation inside a flow collection at line " + line.lineNumber());
+            }
+            index++;
+            text = line.content() + line.trailing();
+            position = 0;
+            lineNumber = line.lineNumber();
+        }
+
+        private char peek() {
+            return text.charAt(position);
+        }
+
+        /**
+         * Whether a {@code :} at the current position separates a key from its value. After a
+         * JSON-like key (quoted scalar or flow collection) the value may follow without white space.
+         */
+        private boolean isPairSeparator(YamlNode key) {
+            if (position >= text.length() || peek() != ':') {
+                return false;
+            }
+            boolean jsonLike = key instanceof YamlSequence || key instanceof YamlMapping
+                || key instanceof YamlScalar scalar && scalar.style() != YamlScalarStyle.PLAIN;
+            return jsonLike || isValueIndicator();
+        }
+
+        private boolean isValueIndicator() {
+            return isIndicator(':');
+        }
+
+        private boolean isIndicator(char indicator) {
+            return position < text.length() && text.charAt(position) == indicator && !isPlainSafe(position + 1);
+        }
+
+        private boolean isPlainSafe(int at) {
+            return at < text.length() && !isBlank(text.charAt(at)) && FLOW_INDICATORS.indexOf(text.charAt(at)) < 0;
+        }
+    }
+
+    private enum Context {
+        /** An implicit mapping key: single-line, no block nodes. */
+        KEY,
+        /** A block mapping value: may be followed by a compact sequence. */
+        VALUE,
+        /** Any other node. */
+        NODE
+    }
+
+    /**
+     * @param end position after the properties and the white space that follows them
+     */
+    private record Properties(String anchor, int end) {
+    }
+
+    private record Quoted(String value, YamlScalarStyle style, String lineText, int end, int lineNumber) {
+    }
+
+    /**
      * One physical line.
      *
      * @param indent     number of leading spaces
@@ -825,14 +1471,23 @@ public final class YamlParser {
      * @param leadingTab whether a tab separates the indentation from non-empty content
      * @param bom        whether the line starts with a byte order mark
      * @param trailing   trailing white space removed from the content (significant in quoted scalars)
+     * @param raw        the whole line without the byte order mark (used by block scalars)
      */
-    private record Line(int lineNumber, int indent, String content, boolean leadingTab, boolean bom, String trailing) {
+    private record Line(
+        int lineNumber,
+        int indent,
+        String content,
+        boolean leadingTab,
+        boolean bom,
+        String trailing,
+        String raw
+    ) {
         boolean ignorable() {
             return content.isEmpty() || content.startsWith("#");
         }
 
         Line withoutByteOrderMark() {
-            return new Line(lineNumber, indent, content, leadingTab, false, trailing);
+            return new Line(lineNumber, indent, content, leadingTab, false, trailing, raw);
         }
     }
 

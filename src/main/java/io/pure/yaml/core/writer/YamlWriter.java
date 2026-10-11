@@ -1,7 +1,9 @@
 package io.pure.yaml.core.writer;
 
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Objects;
+import java.util.Set;
 
 import io.pure.yaml.core.model.YamlAlias;
 import io.pure.yaml.core.model.YamlEntry;
@@ -30,10 +32,16 @@ public final class YamlWriter {
     public String write(YamlNode node) {
         Objects.requireNonNull(node, "node");
         StringBuilder builder = new StringBuilder();
+        State state = new State();
         if (isInline(node)) {
-            appendInline(builder, node);
+            appendInline(builder, node, state);
         } else {
-            appendBlock(builder, node, 0, false, new IdentityHashMap<>());
+            if (appendAnchor(builder, node, state)) {
+                // Properties of a block collection stand on their own line.
+                builder.setLength(builder.length() - 1);
+                builder.append('\n');
+            }
+            appendBlock(builder, node, 0, false, state);
         }
         if (!builder.isEmpty() && builder.charAt(builder.length() - 1) == '\n') {
             builder.setLength(builder.length() - 1);
@@ -41,37 +49,24 @@ public final class YamlWriter {
         return builder.toString();
     }
 
-    private void appendBlock(
-        StringBuilder builder,
-        YamlNode node,
-        int column,
-        boolean continueLine,
-        IdentityHashMap<YamlNode, Boolean> activeNodes
-    ) {
-        ensureNoTagOrAnchor(node);
-        if (activeNodes.put(node, Boolean.TRUE) != null) {
+    private void appendBlock(StringBuilder builder, YamlNode node, int column, boolean continueLine, State state) {
+        if (state.activeNodes.put(node, Boolean.TRUE) != null) {
             throw new YamlWriteException("Cyclic YAML node graph detected");
         }
         try {
             if (node instanceof YamlSequence sequence) {
-                appendSequence(builder, sequence, column, continueLine, activeNodes);
+                appendSequence(builder, sequence, column, continueLine, state);
             } else if (node instanceof YamlMapping mapping) {
-                appendMapping(builder, mapping, column, continueLine, activeNodes);
+                appendMapping(builder, mapping, column, continueLine, state);
             } else {
                 throw new YamlWriteException("Unsupported YAML node: " + node.getClass().getName());
             }
         } finally {
-            activeNodes.remove(node);
+            state.activeNodes.remove(node);
         }
     }
 
-    private void appendSequence(
-        StringBuilder builder,
-        YamlSequence sequence,
-        int column,
-        boolean continueLine,
-        IdentityHashMap<YamlNode, Boolean> activeNodes
-    ) {
+    private void appendSequence(StringBuilder builder, YamlSequence sequence, int column, boolean continueLine, State state) {
         boolean first = true;
         for (YamlNode item : sequence.values()) {
             if (!first || !continueLine) {
@@ -80,46 +75,55 @@ public final class YamlWriter {
             first = false;
             builder.append("- ");
             if (isInline(item)) {
-                appendInline(builder, item);
+                appendInline(builder, item, state);
                 builder.append('\n');
+            } else if (appendAnchor(builder, item, state)) {
+                // "- &anchor" followed by the collection on the next lines.
+                builder.setLength(builder.length() - 1);
+                builder.append('\n');
+                appendBlock(builder, item, column + 2, false, state);
             } else {
-                appendBlock(builder, item, column + 2, true, activeNodes);
+                appendBlock(builder, item, column + 2, true, state);
             }
         }
     }
 
-    private void appendMapping(
-        StringBuilder builder,
-        YamlMapping mapping,
-        int column,
-        boolean continueLine,
-        IdentityHashMap<YamlNode, Boolean> activeNodes
-    ) {
+    private void appendMapping(StringBuilder builder, YamlMapping mapping, int column, boolean continueLine, State state) {
         boolean first = true;
         for (YamlEntry entry : mapping.entries()) {
             if (!first || !continueLine) {
                 indent(builder, column);
             }
             first = false;
-            appendKey(builder, entry.key());
+            appendKey(builder, entry.key(), state);
             builder.append(':');
             if (isInline(entry.value())) {
                 builder.append(' ');
-                appendInline(builder, entry.value());
+                appendInline(builder, entry.value(), state);
                 builder.append('\n');
             } else {
+                if (entry.value().anchor() != null) {
+                    builder.append(' ');
+                    appendAnchor(builder, entry.value(), state);
+                    builder.setLength(builder.length() - 1);
+                }
                 builder.append('\n');
-                appendBlock(builder, entry.value(), column + indentUnit.length(), false, activeNodes);
+                appendBlock(builder, entry.value(), column + indentUnit.length(), false, state);
             }
         }
     }
 
-    private void appendKey(StringBuilder builder, YamlNode key) {
+    private void appendKey(StringBuilder builder, YamlNode key, State state) {
+        if (key instanceof YamlAlias alias) {
+            appendAlias(builder, alias, state);
+            // Anchor names may contain ':', so the separator must not touch the alias.
+            builder.append(' ');
+            return;
+        }
         if (!(key instanceof YamlScalar scalar)) {
             throw new YamlWriteException("Current writer supports only scalar mapping keys");
         }
-        ensureNoTagOrAnchor(scalar);
-        appendScalar(builder, scalar);
+        appendInline(builder, scalar, state);
     }
 
     private static boolean isInline(YamlNode node) {
@@ -129,22 +133,51 @@ public final class YamlWriter {
             || node instanceof YamlMapping mapping && mapping.size() == 0;
     }
 
-    private void appendInline(StringBuilder builder, YamlNode node) {
-        ensureNoTagOrAnchor(node);
+    private void appendInline(StringBuilder builder, YamlNode node, State state) {
+        appendAnchor(builder, node, state);
         switch (node) {
             case YamlScalar scalar -> appendScalar(builder, scalar);
-            case YamlAlias alias -> appendAlias(builder, alias);
+            case YamlAlias alias -> appendAlias(builder, alias, state);
             case YamlSequence ignored -> builder.append("[]");
             case YamlMapping ignored -> builder.append("{}");
         }
     }
 
-    private void appendAlias(StringBuilder builder, YamlAlias alias) {
+    /**
+     * Writes "&amp;name " when the node has an anchor and records the anchor as defined.
+     *
+     * @return whether an anchor was written
+     */
+    private boolean appendAnchor(StringBuilder builder, YamlNode node, State state) {
+        if (node.tag() != null) {
+            throw new YamlWriteException("Tags are not supported by the writer");
+        }
+        String anchor = node.anchor();
+        if (anchor == null) {
+            return false;
+        }
+        if (node instanceof YamlAlias) {
+            throw new YamlWriteException("An alias cannot have an anchor");
+        }
+        ensureValidAnchorName(anchor);
+        state.definedAnchors.add(anchor);
+        builder.append('&').append(anchor).append(' ');
+        return true;
+    }
+
+    private void appendAlias(StringBuilder builder, YamlAlias alias, State state) {
         String name = alias.alias();
-        if (name == null || name.isEmpty() || name.chars().anyMatch(ch -> Character.isWhitespace(ch) || ",[]{}".indexOf(ch) >= 0)) {
-            throw new YamlWriteException("Invalid alias name: " + name);
+        ensureValidAnchorName(name);
+        if (!state.definedAnchors.contains(name)) {
+            throw new YamlWriteException("Alias *" + name + " refers to an anchor that is not defined before it");
         }
         builder.append('*').append(name);
+    }
+
+    private static void ensureValidAnchorName(String name) {
+        if (name == null || name.isEmpty() || name.chars().anyMatch(ch -> Character.isWhitespace(ch) || ",[]{}".indexOf(ch) >= 0)) {
+            throw new YamlWriteException("Invalid anchor or alias name: " + name);
+        }
     }
 
     private void appendScalar(StringBuilder builder, YamlScalar scalar) {
@@ -154,7 +187,8 @@ public final class YamlWriter {
             return;
         }
         switch (scalar.style()) {
-            case DOUBLE_QUOTED -> appendDoubleQuoted(builder, value);
+            // Block scalars are written as double-quoted scalars, which preserve the same value.
+            case DOUBLE_QUOTED, LITERAL, FOLDED -> appendDoubleQuoted(builder, value);
             case SINGLE_QUOTED -> {
                 if (value.codePoints().anyMatch(YamlWriter::needsEscape)) {
                     appendDoubleQuoted(builder, value);
@@ -256,17 +290,19 @@ public final class YamlWriter {
         return !printable;
     }
 
-    private static void ensureNoTagOrAnchor(YamlNode node) {
-        if (node.tag() != null || node.anchor() != null) {
-            throw new YamlWriteException("Tags and anchors are not supported by the writer");
-        }
-    }
-
     private static boolean isBlank(char ch) {
         return ch == ' ' || ch == '\t';
     }
 
     private static void indent(StringBuilder builder, int column) {
         builder.repeat(' ', column);
+    }
+
+    /**
+     * Per-call state: nodes on the current path (cycle detection) and anchors written so far.
+     */
+    private static final class State {
+        private final IdentityHashMap<YamlNode, Boolean> activeNodes = new IdentityHashMap<>();
+        private final Set<String> definedAnchors = new HashSet<>();
     }
 }

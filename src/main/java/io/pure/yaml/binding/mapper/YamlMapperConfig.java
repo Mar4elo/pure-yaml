@@ -8,9 +8,10 @@ public record YamlMapperConfig(
     boolean failOnUnknownProperties,
     YamlInclude.Include defaultInclusion,
     YamlProcessingLimits processingLimits,
-    boolean coerceQuotedScalars
+    boolean coerceQuotedScalars,
+    boolean resolveAliases
 ) {
     public static YamlMapperConfig defaults() {
-        return new YamlMapperConfig(true, true, YamlInclude.Include.ALWAYS, YamlProcessingLimits.defaults(), true);
+        return new YamlMapperConfig(true, true, YamlInclude.Include.ALWAYS, YamlProcessingLimits.defaults(), true, false);
     }
 }

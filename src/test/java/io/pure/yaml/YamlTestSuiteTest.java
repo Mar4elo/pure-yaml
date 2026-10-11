@@ -127,7 +127,8 @@ class YamlTestSuiteTest {
             case YamlMapping mapping -> mapping.entries().stream()
                 .map(entry -> render(entry.key()) + ":" + render(entry.value()))
                 .collect(Collectors.joining(",", "{", "}"));
-            case YamlAlias alias -> "*" + alias.alias();
+            // Aliases are compared by the node they refer to, as in the JSON form of the suite.
+            case YamlAlias alias -> alias.target() == null ? "*" + alias.alias() : render(alias.target());
         };
     }
 

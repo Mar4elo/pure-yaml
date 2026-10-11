@@ -25,11 +25,11 @@ RFC 9512 does not redefine the whole YAML language. Instead, it registers the `a
 This project takes that seriously and starts from a safer subset first:
 
 - single-document input by default (multi-document streams only through `parseStream` with an explicit limit)
-- block-style collections
 - no implicit object construction
-- no custom tag resolution: tags, anchors and other unsupported syntax are rejected instead of being read as text
+- no custom tag resolution: tags and other unsupported syntax are rejected instead of being read as text
 - duplicate mapping keys are rejected
-- alias nodes are parsed, but alias resolution is not enabled for Java object binding
+- aliases must refer to an anchor defined earlier in the same document; recursive aliases are rejected
+- alias resolution in Java binding is opt-in and bounded by expansion and depth limits
 
 That means the library is intentionally conservative today, with room to grow later.
 
@@ -97,7 +97,12 @@ The current parser/writer supports a safe, practical subset of YAML:
 - empty values (`key:` or `-`), read as null
 - streams without documents (empty input, only comments or `...`): `parseStream` returns no documents,
   `parse` returns a document with an empty (null) root
-- empty flow collections `[]` and `{}`
+- flow collections (`[a, b]`, `{a: 1}`), nested and spanning several lines, including single-pair
+  entries (`[key: value]`), empty values (`{a, b: }`), trailing commas and JSON-style adjacent values
+  (`{"a":1}`); JSON documents can be read as they are
+- literal (`|`) and folded (`>`) block scalars with chomping (`-`, `+`) and indentation indicators
+- anchors (`&name`) on scalars, collections and keys, and aliases (`*name`), including alias keys
+  whose anchor is a scalar
 - scalar mapping keys
 - plain scalars
 - single-quoted scalars
@@ -105,7 +110,7 @@ The current parser/writer supports a safe, practical subset of YAML:
 - comments
 - UTF-8 text input; a byte order mark is accepted only at the start of a document, and characters
   outside the YAML printable set are rejected
-- alias nodes as parsed syntax objects
+- fragment identifiers of RFC 9512 (`*anchor` and JSON Pointer) through `YamlFragment`
 
 Input that falls outside this subset is rejected with a `YamlParseException` that names the line.
 The parser never silently skips or reinterprets content.
@@ -115,13 +120,11 @@ The parser never silently skips or reinterprets content.
 These are currently rejected or intentionally left disabled:
 
 - multi-document streams in `parse()` (use `parseStream()` with an explicit `maxDocuments`)
-- non-empty flow collections like `[1, 2]` and `{a: 1}`
-- block scalars (`|`, `>`)
 - block collections on the document start line (`--- key: value`), empty keys (`: value`)
-- anchors (`&name`), tags (`!tag`) and `%TAG` directives
-- complex mapping keys (`? key`)
-- merge keys
-- anchor resolution during Java binding
+- tags (`!tag`, `!!str`) and `%TAG` directives
+- complex mapping keys (`? key`) and non-scalar keys such as `[a, b]: value`
+- recursive aliases (an alias inside the node its anchor belongs to)
+- merge keys (`<<`)
 - custom tags for object construction
 - implicit polymorphic deserialization
 - non-scalar mapping keys and map keys of other Java types
@@ -436,14 +439,58 @@ YamlMapper mapper = YamlMapper.builder()
         64,      // maxAliases
         1,       // maxDocuments
         500_000, // maxCharacters
-        1_000    // maxNumberLength
+        1_000,   // maxNumberLength
+        10_000   // maxAliasExpansion
     ))
+    .resolveAliases(true)
     .build();
 ```
 
 `coerceQuotedScalars` controls whether quoted values such as `"8080"` or `"true"` may be read into
 numeric and boolean targets. It is enabled by default; disable it to require unquoted values, as the
 YAML 1.2 core schema does.
+
+### Anchors and aliases
+
+The parser links every alias to the node its anchor belongs to (`YamlAlias.target()`); an alias to an
+undefined anchor, or to a node that is still being parsed, is a syntax error. The YAML tree keeps
+aliases as `YamlAlias` nodes, so it never becomes cyclic, and the writer writes anchors and aliases back.
+
+Java binding rejects aliases unless `resolveAliases(true)` is set. When it is enabled, an alias is read
+as the anchored node, and two limits protect against exponential expansion (the "billion laughs"
+input): the number of nodes read through aliases (`maxAliasExpansion`) and the nesting depth
+(`maxDepth`), both counted per `readValue` call.
+
+```java
+record Settings(int timeout, int retries) {
+}
+
+record Service(String name, Settings settings) {
+}
+
+YamlMapper mapper = YamlMapper.builder().resolveAliases(true).build();
+
+List<Service> services = mapper.readValue("""
+    - name: api
+      settings: &defaults {timeout: 30, retries: 3}
+    - name: worker
+      settings: *defaults
+    """, new YamlTypeRef<List<Service>>() {});
+```
+
+### Fragment identifiers
+
+`YamlFragment` evaluates the fragment identifiers that RFC 9512 defines for `application/yaml`:
+
+```java
+YamlNode root = Yaml.parse(yaml);
+
+YamlFragment.resolve(root, "#/servers/0/host"); // JSON Pointer (RFC 6901), follows aliases
+YamlFragment.resolve(root, "#*defaults");       // the first node with anchor "defaults"
+```
+
+A fragment that matches nothing yields `Optional.empty()`. For a `YamlStream`, alias fragments search
+all documents in order, and JSON Pointer fragments require a single-document stream.
 
 ### Processing limits
 
@@ -455,6 +502,7 @@ YAML 1.2 core schema does.
 - `maxCharacters`
 - `maxNumberLength`: maximum length of a numeric literal and maximum magnitude (in digits) of
   `BigInteger`/`BigDecimal` values, which protects against inputs such as `1e1000000000`
+- `maxAliasExpansion`: maximum number of nodes read through aliases by one `readValue` call
 
 The defaults are conservative and suitable for many config-oriented use cases. The parser can also
 be used with custom limits directly: `Yaml.parse(text, limits)`, `Yaml.parseStream(text, limits)`.
@@ -466,7 +514,8 @@ This library intentionally defaults to safer behavior.
 ### Safe-by-default choices
 
 - single-document parsing
-- no alias resolution in Java binding
+- no alias resolution in Java binding unless enabled; when enabled, expansion and depth are bounded
+- recursive aliases and aliases to undefined anchors are rejected by the parser
 - no custom object construction from tags
 - no code execution hooks
 - configurable parser limits, including numeric literal limits
@@ -497,7 +546,14 @@ That wording matters:
 - RFC 9512 discusses interoperability and security expectations
 - RFC 9512 does **not** replace the full YAML language specification
 
-In practice, this project uses RFC 9512 as the guiding safety and interoperability baseline, while implementing a narrower and more controlled subset of YAML behavior.
+In practice, this project uses RFC 9512 as the guiding safety and interoperability baseline, while implementing a narrower and more controlled subset of YAML behavior:
+
+- fragment identifiers (section 1.2): `*anchor` and JSON Pointer fragments through `YamlFragment`
+- multi-document streams (section 3.2): `parse()` signals an error instead of ignoring extra
+  documents, and anchors are scoped to their document
+- JSON interoperability (section 3.4): flow collections make JSON documents readable; keys are
+  scalars, and tags and cyclic references are not supported
+- resource exhaustion (section 4.2): parser limits, alias expansion and depth limits, no cycles
 
 Reference:
 
@@ -520,6 +576,7 @@ Key types:
 
 - `Yaml`
 - `YamlException`
+- `YamlFragment`
 - `YamlParser`
 - `YamlWriter`
 - `YamlNode`
@@ -567,7 +624,7 @@ Typical binding errors include:
 - invalid, out-of-range or oversized numbers
 - invalid values for JDK value types (dates, UUIDs, ...)
 - types that are not accessible through reflection
-- alias resolution attempts where disabled
+- alias resolution attempts where disabled, or alias expansion beyond the configured limits
 - cyclic object graphs
 
 ## Testing
@@ -583,7 +640,9 @@ The project includes tests for:
 - YAML directives and document markers
 - BOM and comments
 - parser limits
-- alias parsing
+- flow collections, block scalars, anchors and aliases
+- RFC 9512 fragment identifiers
+- alias expansion limits
 - cycle rejection
 - custom adapters
 - strict boolean/null handling
@@ -615,9 +674,9 @@ or when valid YAML is rejected without being listed in
 `src/test/resources/yaml-test-suite/unsupported-cases.txt`. That file lists the cases that use
 syntax outside the supported subset; a case must be removed from it once it starts to pass.
 
-Current results: 116 of 308 valid documents are parsed and match the expected JSON, the remaining
-192 use unsupported syntax (flow collections, block scalars, anchors, tags, complex or empty keys);
-all 94 invalid documents are rejected.
+Current results: 235 of 308 valid documents are parsed and match the expected JSON; the remaining
+73 use unsupported syntax (tags, complex, empty or non-scalar keys); all 94 invalid documents are
+rejected.
 
 ## Limitations
 
@@ -625,19 +684,19 @@ Before using this library in production, be aware of the current scope:
 
 - not a full YAML 1.2 implementation
 - not yet a general-purpose replacement for mature YAML libraries
-- only empty flow-style collections (`[]`, `{}`)
-- no block scalars
+- no tags, complex keys or non-scalar keys
 - no merge-key support
 - no tag-driven object model
-- no alias resolution for object binding
+- alias resolution for object binding is opt-in
+- the writer always uses block style and writes block scalars as double-quoted scalars
 - no streaming read/write API for very large documents
 
 ## Roadmap
 
 Planned directions include:
 
-1. anchors and aliases as first-class graph resolution
-2. flow collections and block scalars
+1. tags with an explicit, safe resolution policy
+2. complex and non-scalar mapping keys
 3. merge-key policy support
 4. broader YAML 1.2 compatibility
 5. additional performance tuning for large inputs

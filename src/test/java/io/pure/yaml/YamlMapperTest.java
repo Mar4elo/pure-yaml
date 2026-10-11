@@ -146,7 +146,8 @@ class YamlMapperTest {
         YamlMappingException exception = assertThrows(
             YamlMappingException.class,
             () -> mapper.readValue("""
-                value: *shared
+                value: &shared x
+                copy: *shared
                 """, AliasHolder.class)
         );
         assertTrue(exception.getMessage().contains("Alias resolution is not enabled"));
@@ -155,6 +156,7 @@ class YamlMapperTest {
     @Test
     void canReadAliasNodeIntoYamlTree() {
         YamlNode node = mapper.readValue("""
+            anchor: &shared x
             value: *shared
             """, YamlNode.class);
 
@@ -681,7 +683,7 @@ class YamlMapperTest {
     record Flags(boolean enabled, boolean disabled, Optional<String> note) {
     }
 
-    record AliasHolder(String value) {
+    record AliasHolder(String value, String copy) {
     }
 
     record Token(String value) {

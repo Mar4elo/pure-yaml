@@ -21,12 +21,19 @@ public final class YamlMapping implements YamlNode {
         this.anchor = anchor;
     }
 
+    /**
+     * Adds an entry. Scalar keys, and aliases whose target is a scalar, are indexed by their text
+     * and must be unique.
+     */
     public void put(YamlNode key, YamlNode value) {
-        if (key instanceof YamlScalar scalar) {
-            if (scalarIndex.containsKey(scalar.value())) {
-                throw new IllegalArgumentException("Duplicate mapping key: " + scalar.value());
+        YamlScalar scalarKey = key instanceof YamlAlias alias && alias.target() instanceof YamlScalar target
+            ? target
+            : key instanceof YamlScalar scalar ? scalar : null;
+        if (scalarKey != null) {
+            if (scalarIndex.containsKey(scalarKey.value())) {
+                throw new IllegalArgumentException("Duplicate mapping key: " + scalarKey.value());
             }
-            scalarIndex.put(scalar.value(), value);
+            scalarIndex.put(scalarKey.value(), value);
         }
         entries.add(new YamlEntry(key, value));
     }

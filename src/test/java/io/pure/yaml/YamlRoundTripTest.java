@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import io.pure.yaml.core.Yaml;
 import io.pure.yaml.core.YamlException;
+import io.pure.yaml.core.model.YamlAlias;
 import io.pure.yaml.core.model.YamlEntry;
 import io.pure.yaml.core.model.YamlMapping;
 import io.pure.yaml.core.model.YamlNode;
@@ -129,7 +130,7 @@ class YamlRoundTripTest {
                     assertSameTree(expectedEntry.value(), actualEntry.value(), yaml);
                 }
             }
-            default -> assertEquals(expected, actual, yaml);
+            case YamlAlias alias -> assertEquals(alias.alias(), assertInstanceOf(YamlAlias.class, actual, yaml).alias(), yaml);
         }
     }
 

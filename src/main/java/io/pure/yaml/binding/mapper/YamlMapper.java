@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import io.pure.yaml.annotation.YamlInclude;
@@ -115,7 +116,7 @@ public final class YamlMapper {
 
     @SuppressWarnings("unchecked")
     public <T> T readValue(YamlNode node, Type type) {
-        return (T) readValueInternal(node, type, "$");
+        return (T) readValueInternal(node, type, "$", new ReadContext());
     }
 
     private YamlNode parse(String yaml) {
@@ -270,20 +271,36 @@ public final class YamlMapper {
         return number.toString();
     }
 
-    private Object readValueInternal(YamlNode node, Type type, String path) {
+    private Object readValueInternal(YamlNode node, Type type, String path, ReadContext context) {
         Objects.requireNonNull(type, "type");
-
-        TypeAdapter<Object> adapter = findReadAdapter(type);
-        if (adapter != null) {
-            return adapter.fromYaml(node, type, this, path);
-        }
-
         Class<?> rawClass = Types.rawClass(type);
         if (YamlNode.class.isAssignableFrom(rawClass)) {
             if (!rawClass.isInstance(node)) {
                 throw new YamlMappingException("Expected " + rawClass.getSimpleName() + " at " + path);
             }
             return node;
+        }
+        if (node instanceof YamlAlias alias && config.resolveAliases()) {
+            return context.expand(alias, path, target -> readValueInternal(target, type, path, context));
+        }
+        context.visitNode(path);
+        boolean collection = node instanceof YamlMapping || node instanceof YamlSequence;
+        if (collection) {
+            context.enterCollection(path);
+        }
+        try {
+            return readNode(node, type, rawClass, path, context);
+        } finally {
+            if (collection) {
+                context.exitCollection();
+            }
+        }
+    }
+
+    private Object readNode(YamlNode node, Type type, Class<?> rawClass, String path, ReadContext context) {
+        TypeAdapter<Object> adapter = findReadAdapter(type);
+        if (adapter != null) {
+            return adapter.fromYaml(node, type, this, path);
         }
         if (isNullNode(node)) {
             if (rawClass.isPrimitive()) {
@@ -296,10 +313,10 @@ public final class YamlMapper {
         }
 
         if (node instanceof YamlAlias alias) {
-            throw new YamlMappingException("Alias resolution is not enabled at " + path + ": *" + alias.alias());
+            throw aliasResolutionDisabled(alias, path);
         }
         if (rawClass == Object.class) {
-            return readUntyped(node, path);
+            return readUntyped(node, path, context);
         }
         if (rawClass == String.class) {
             return expectScalarValue(node, path);
@@ -324,29 +341,29 @@ public final class YamlMapper {
             Type nestedType = type instanceof ParameterizedType parameterizedType
                 ? unwrapWildcard(parameterizedType.getActualTypeArguments()[0])
                 : Object.class;
-            return Optional.ofNullable(readValueInternal(node, nestedType, path));
+            return Optional.ofNullable(readValueInternal(node, nestedType, path, context));
         }
         ValueTypes.Codec codec = ValueTypes.forType(rawClass);
         if (codec != null) {
             return readValueType(node, codec, path);
         }
         if (Map.class.isAssignableFrom(rawClass)) {
-            return readMap(node, type, rawClass, path);
+            return readMap(node, type, rawClass, path, context);
         }
         if (Collection.class.isAssignableFrom(rawClass)) {
-            return readCollection(node, type, rawClass, path);
+            return readCollection(node, type, rawClass, path, context);
         }
         if (rawClass.isArray()) {
             Type componentType = type instanceof GenericArrayType genericArrayType
                 ? genericArrayType.getGenericComponentType()
                 : rawClass.componentType();
-            return readArray(node, componentType, path);
+            return readArray(node, componentType, path, context);
         }
 
-        return readBean(node, type, rawClass, path);
+        return readBean(node, type, rawClass, path, context);
     }
 
-    private Object readBean(YamlNode node, Type type, Class<?> rawClass, String path) {
+    private Object readBean(YamlNode node, Type type, Class<?> rawClass, String path, ReadContext context) {
         YamlMapping mapping = expectMapping(node, path);
         BeanDescriptor descriptor = introspector.describe(rawClass);
         CreatorDescriptor creator = descriptor.creator();
@@ -373,7 +390,7 @@ public final class YamlMapper {
             }
             creatorNames.add(parameter.yamlName());
             YamlNode item = mapping.get(parameter.yamlName());
-            args[i] = readValueInternal(item == null ? nullScalar() : item, parameterType, path + "." + parameter.yamlName());
+            args[i] = readValueInternal(item == null ? nullScalar() : item, parameterType, path + "." + parameter.yamlName(), context);
         }
 
         List<YamlEntry> propertyEntries = new ArrayList<>();
@@ -394,7 +411,7 @@ public final class YamlMapper {
         for (YamlEntry entry : propertyEntries) {
             BeanProperty property = descriptor.properties().get(scalarKey(entry.key(), path));
             Type propertyType = Types.resolve(property.type(), bindings);
-            property.mutator().set(instance, readValueInternal(entry.value(), propertyType, path + "." + property.yamlName()));
+            property.mutator().set(instance, readValueInternal(entry.value(), propertyType, path + "." + property.yamlName(), context));
         }
         return instance;
     }
@@ -405,12 +422,12 @@ public final class YamlMapper {
         }
     }
 
-    private Object readUntyped(YamlNode node, String path) {
+    private Object readUntyped(YamlNode node, String path, ReadContext context) {
         if (node instanceof YamlMapping) {
-            return readMap(node, Map.class, Map.class, path);
+            return readMap(node, Map.class, Map.class, path, context);
         }
         if (node instanceof YamlSequence) {
-            return readCollection(node, List.class, List.class, path);
+            return readCollection(node, List.class, List.class, path, context);
         }
         YamlScalar scalar = (YamlScalar) node;
         if (scalar.style() != YamlScalarStyle.PLAIN) {
@@ -451,16 +468,16 @@ public final class YamlMapper {
         return value;
     }
 
-    private Object readArray(YamlNode node, Type componentType, String path) {
+    private Object readArray(YamlNode node, Type componentType, String path, ReadContext context) {
         YamlSequence sequence = expectSequence(node, path);
         Object result = Array.newInstance(Types.rawClass(componentType), sequence.size());
         for (int i = 0; i < sequence.size(); i++) {
-            Array.set(result, i, readValueInternal(sequence.get(i), componentType, path + "[" + i + "]"));
+            Array.set(result, i, readValueInternal(sequence.get(i), componentType, path + "[" + i + "]", context));
         }
         return result;
     }
 
-    private Object readCollection(YamlNode node, Type type, Class<?> rawClass, String path) {
+    private Object readCollection(YamlNode node, Type type, Class<?> rawClass, String path, ReadContext context) {
         YamlSequence sequence = expectSequence(node, path);
         Type elementType = Object.class;
         if (type instanceof ParameterizedType parameterizedType) {
@@ -468,12 +485,12 @@ public final class YamlMapper {
         }
         Collection<Object> result = instantiateCollection(rawClass);
         for (int i = 0; i < sequence.size(); i++) {
-            result.add(readValueInternal(sequence.get(i), elementType, path + "[" + i + "]"));
+            result.add(readValueInternal(sequence.get(i), elementType, path + "[" + i + "]", context));
         }
         return result;
     }
 
-    private Object readMap(YamlNode node, Type type, Class<?> rawClass, String path) {
+    private Object readMap(YamlNode node, Type type, Class<?> rawClass, String path, ReadContext context) {
         YamlMapping mapping = expectMapping(node, path);
         Type keyType = String.class;
         Type mapValueType = Object.class;
@@ -490,14 +507,14 @@ public final class YamlMapper {
         for (YamlEntry entry : mapping.entries()) {
             String keyText = scalarKey(entry.key(), path);
             String entryPath = path + "." + keyText;
-            Object key = textKeys ? keyText : readValueInternal(entry.key(), keyType, entryPath);
+            Object key = textKeys ? keyText : readValueInternal(entry.key(), keyType, entryPath, context);
             if (key == null) {
                 throw new YamlMappingException("Null map key at " + entryPath);
             }
             if (result.containsKey(key)) {
                 throw new YamlMappingException("Duplicate map key after conversion at " + entryPath);
             }
-            result.put(key, readValueInternal(entry.value(), mapValueType, entryPath));
+            result.put(key, readValueInternal(entry.value(), mapValueType, entryPath, context));
         }
         return result;
     }
@@ -798,10 +815,60 @@ public final class YamlMapper {
     }
 
     private String scalarKey(YamlNode key, String path) {
+        if (key instanceof YamlAlias alias) {
+            if (!config.resolveAliases()) {
+                throw aliasResolutionDisabled(alias, path);
+            }
+            key = alias.target();
+        }
         if (!(key instanceof YamlScalar scalar)) {
             throw new YamlMappingException("Only scalar keys are supported at " + path);
         }
         return scalar.value();
+    }
+
+    private static YamlMappingException aliasResolutionDisabled(YamlAlias alias, String path) {
+        return new YamlMappingException(
+            "Alias resolution is not enabled at " + path + ": *" + alias.alias() + " (see YamlMapperBuilder.resolveAliases)"
+        );
+    }
+
+    /**
+     * State of one readValue call: nesting depth and the number of nodes read through aliases,
+     * which bounds exponential expansion such as the "billion laughs" input (RFC 9512, 4.2).
+     */
+    private final class ReadContext {
+        private int depth;
+        private int expandedNodes;
+        private int expansionDepth;
+
+        Object expand(YamlAlias alias, String path, Function<YamlNode, Object> reader) {
+            if (alias.target() == null) {
+                throw new YamlMappingException("Unresolved alias at " + path + ": *" + alias.alias());
+            }
+            expansionDepth++;
+            try {
+                return reader.apply(alias.target());
+            } finally {
+                expansionDepth--;
+            }
+        }
+
+        void visitNode(String path) {
+            if (expansionDepth > 0 && ++expandedNodes > config.processingLimits().maxAliasExpansion()) {
+                throw new YamlMappingException("Alias expansion exceeds configured limit at " + path);
+            }
+        }
+
+        void enterCollection(String path) {
+            if (++depth > config.processingLimits().maxDepth()) {
+                throw new YamlMappingException("Nesting depth exceeds configured limit at " + path);
+            }
+        }
+
+        void exitCollection() {
+            depth--;
+        }
     }
 
     private static Type unwrapWildcard(Type type) {

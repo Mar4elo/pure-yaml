@@ -5,195 +5,76 @@
 #
 # Suite: https://github.com/yaml/yaml-test-suite, branch "data",
 # commit 6ad3d2c62885d82fc349026c136ef560838fdf3d
-26DV      # Anchors are not supported
 2AUY      # Tags are not supported
-2G84/02   # Block scalars ('|', '>') are not supported
-2G84/03   # Block scalars ('|', '>') are not supported
 2JQS      # Empty mapping keys are not supported
-2SXE      # Anchors are not supported
 2XXW      # Tags are not supported
 33X3      # Tags are not supported
 35KP      # Tags are not supported
-3GZX      # Anchors are not supported
-3R3P      # Anchors are not supported
-4ABK      # Flow collections are not supported (only empty [] and {})
-4FJ6      # Flow collections are not supported (only empty [] and {})
-4MUZ/00   # Flow collections are not supported (only empty [] and {})
-4MUZ/01   # Flow collections are not supported (only empty [] and {})
-4MUZ/02   # Flow collections are not supported (only empty [] and {})
-4Q9F      # Block scalars ('|', '>') are not supported
-4QFQ      # Block scalars ('|', '>') are not supported
-4RWC      # Flow collections are not supported (only empty [] and {})
-4WA9      # Block scalars ('|', '>') are not supported
-4ZYM      # Block scalars ('|', '>') are not supported
+4FJ6      # Only scalar mapping keys are supported
 52DL      # Tags are not supported
-54T7      # Flow collections are not supported (only empty [] and {})
 565N      # Tags are not supported
 57H4      # Tags are not supported
-58MP      # Flow collections are not supported (only empty [] and {})
-5BVJ      # Block scalars ('|', '>') are not supported
-5C5M      # Flow collections are not supported (only empty [] and {})
-5GBF      # Block scalars ('|', '>') are not supported
-5KJE      # Flow collections are not supported (only empty [] and {})
-5MUD      # Flow collections are not supported (only empty [] and {})
-5T43      # Flow collections are not supported (only empty [] and {})
 5TYM      # %TAG directives are not supported
 5WE3      # Complex mapping keys are not supported
-652Z      # Flow collections are not supported (only empty [] and {})
-6BFJ      # Anchors are not supported
-6CA3      # Flow collections are not supported (only empty [] and {})
+6BFJ      # Only scalar mapping keys are supported
 6CK3      # %TAG directives are not supported
-6FWR      # Block scalars ('|', '>') are not supported
-6HB6      # Block scalars ('|', '>') are not supported
-6JQW      # Block scalars ('|', '>') are not supported
 6JWB      # Tags are not supported
-6KGN      # Anchors are not supported
 6M2F      # Complex mapping keys are not supported
 6PBE      # Complex mapping keys are not supported
-6VJK      # Block scalars ('|', '>') are not supported
 6WLZ      # Tags are not supported
-735Y      # Block scalars ('|', '>') are not supported
+735Y      # Tags are not supported
 74H7      # Tags are not supported
-753E      # Block scalars ('|', '>') are not supported
-7BMT      # Anchors are not supported
-7BUB      # Anchors are not supported
 7FWL      # Tags are not supported
-7T8X      # Block scalars ('|', '>') are not supported
-7TMG      # Flow collections are not supported (only empty [] and {})
 7W2P      # Complex mapping keys are not supported
-87E4      # Flow collections are not supported (only empty [] and {})
-8KB6      # Flow collections are not supported (only empty [] and {})
 8MK2      # Tags are not supported
-8UDB      # Flow collections are not supported (only empty [] and {})
-8XYN      # Anchors are not supported
-93WF      # Block scalars ('|', '>') are not supported
-96L6      # Block scalars ('|', '>') are not supported
-96NN/00   # Block scalars ('|', '>') are not supported
-96NN/01   # Block scalars ('|', '>') are not supported
-9BXH      # Flow collections are not supported (only empty [] and {})
-9KAX      # Anchors are not supported
-9MMW      # Flow collections are not supported (only empty [] and {})
-9SA2      # Flow collections are not supported (only empty [] and {})
+9KAX      # Tags are not supported
+9MMW      # Only scalar mapping keys are supported
 9WXW      # Tags are not supported
 A2M4      # Complex mapping keys are not supported
-A6F9      # Block scalars ('|', '>') are not supported
-B3HG      # Block scalars ('|', '>') are not supported
-BU8L      # Anchors are not supported
-C2DT      # Flow collections are not supported (only empty [] and {})
+BU8L      # Tags are not supported
 C4HZ      # %TAG directives are not supported
 CC74      # %TAG directives are not supported
-CFD4      # Flow collections are not supported (only empty [] and {})
-CN3R      # Anchors are not supported
-CT4Q      # Flow collections are not supported (only empty [] and {})
+CFD4      # Empty mapping keys are not supported
+CT4Q      # Complex mapping keys are not supported
 CUP7      # Tags are not supported
-D83L      # Block scalars ('|', '>') are not supported
-D88J      # Flow collections are not supported (only empty [] and {})
-DBG4      # Flow collections are not supported (only empty [] and {})
-DFF7      # Flow collections are not supported (only empty [] and {})
-DHP8      # Flow collections are not supported (only empty [] and {})
-DK3J      # Block scalars ('|', '>') are not supported
-DWX9      # Block scalars ('|', '>') are not supported
-E76Z      # Anchors are not supported
+DFF7      # Complex mapping keys are not supported
 EHF6      # Tags are not supported
-F2C7      # Anchors are not supported
-F3CP      # Flow collections are not supported (only empty [] and {})
-F6MC      # Block scalars ('|', '>') are not supported
-F8F9      # Block scalars ('|', '>') are not supported
+F2C7      # Tags are not supported
 FH7J      # Tags are not supported
-FP8R      # Block scalars ('|', '>') are not supported
-FRK4      # Flow collections are not supported (only empty [] and {})
-FTA2      # Anchors are not supported
-FUP4      # Flow collections are not supported (only empty [] and {})
-G992      # Block scalars ('|', '>') are not supported
+FRK4      # Complex mapping keys are not supported
 GH63      # Complex mapping keys are not supported
-H2RW      # Block scalars ('|', '>') are not supported
-HM87/00   # Flow collections are not supported (only empty [] and {})
-HM87/01   # Flow collections are not supported (only empty [] and {})
-HMK4      # Block scalars ('|', '>') are not supported
 HMQ5      # Tags are not supported
-J3BT      # Block scalars ('|', '>') are not supported
 J7PZ      # Tags are not supported
-JEF9/00   # Block scalars ('|', '>') are not supported
-JEF9/01   # Block scalars ('|', '>') are not supported
-JEF9/02   # Block scalars ('|', '>') are not supported
-JR7V      # Flow collections are not supported (only empty [] and {})
-JS2J      # Anchors are not supported
 JTV5      # Complex mapping keys are not supported
-K3WX      # Flow collections are not supported (only empty [] and {})
-K527      # Block scalars ('|', '>') are not supported
-K858      # Block scalars ('|', '>') are not supported
 KK5P      # Complex mapping keys are not supported
-KSS4      # Anchors are not supported
-L24T/00   # Block scalars ('|', '>') are not supported
-L24T/01   # Block scalars ('|', '>') are not supported
 L94M      # Complex mapping keys are not supported
-L9U5      # Flow collections are not supported (only empty [] and {})
 LE5A      # Tags are not supported
-LP6E      # Flow collections are not supported (only empty [] and {})
-LQZ7      # Flow collections are not supported (only empty [] and {})
-LX3P      # Flow collections are not supported (only empty [] and {})
-M29M      # Block scalars ('|', '>') are not supported
+LX3P      # Only scalar mapping keys are supported
 M2N8/00   # Complex mapping keys are not supported
 M2N8/01   # Complex mapping keys are not supported
-M5C3      # Block scalars ('|', '>') are not supported
+M5C3      # Tags are not supported
 M5DY      # Complex mapping keys are not supported
-M6YH      # Block scalars ('|', '>') are not supported
-M7A3      # Block scalars ('|', '>') are not supported
-M7NX      # Flow collections are not supported (only empty [] and {})
-M9B4      # Block scalars ('|', '>') are not supported
-MJS9      # Block scalars ('|', '>') are not supported
-MXS3      # Flow collections are not supported (only empty [] and {})
-MYW6      # Block scalars ('|', '>') are not supported
-MZX3      # Block scalars ('|', '>') are not supported
 NHX8      # Empty mapping keys are not supported
-NJ66      # Flow collections are not supported (only empty [] and {})
 NKF9      # Empty mapping keys are not supported
-P2AD      # Block scalars ('|', '>') are not supported
 P76L      # %TAG directives are not supported
-PW8X      # Anchors are not supported
-Q88A      # Flow collections are not supported (only empty [] and {})
-Q9WF      # Flow collections are not supported (only empty [] and {})
-QF4Y      # Flow collections are not supported (only empty [] and {})
-R4YG      # Block scalars ('|', '>') are not supported
-R52L      # Flow collections are not supported (only empty [] and {})
+PW8X      # Empty mapping keys are not supported
+Q9WF      # Only scalar mapping keys are supported
 RR7F      # Complex mapping keys are not supported
 RZP5      # Complex mapping keys are not supported
-RZT7      # Block scalars ('|', '>') are not supported
 S3PD      # Empty mapping keys are not supported
 S4JQ      # Tags are not supported
 S9E8      # Complex mapping keys are not supported
-SBG9      # Flow collections are not supported (only empty [] and {})
-SKE5      # Anchors are not supported
+SBG9      # Only scalar mapping keys are supported
 SM9W/01   # Empty mapping keys are not supported
-T26H      # Block scalars ('|', '>') are not supported
-T5N4      # Block scalars ('|', '>') are not supported
-TS54      # Block scalars ('|', '>') are not supported
 U3C3      # %TAG directives are not supported
-U3XV      # Anchors are not supported
-UDM2      # Flow collections are not supported (only empty [] and {})
-UDR7      # Flow collections are not supported (only empty [] and {})
 UGM3      # Tags are not supported
 UKK6/00   # Empty mapping keys are not supported
 UKK6/02   # Tags are not supported
-UT92      # Flow collections are not supported (only empty [] and {})
-V55R      # Anchors are not supported
 V9D5      # Complex mapping keys are not supported
-VJP3/01   # Flow collections are not supported (only empty [] and {})
-W42U      # Block scalars ('|', '>') are not supported
-W4TN      # Block scalars ('|', '>') are not supported
-W5VH      # Anchors are not supported
-WZ62      # Flow collections are not supported (only empty [] and {})
-X38W      # Flow collections are not supported (only empty [] and {})
+WZ62      # Tags are not supported
+X38W      # Only scalar mapping keys are supported
 X8DW      # Complex mapping keys are not supported
-XV9V      # Block scalars ('|', '>') are not supported
 XW4D      # Complex mapping keys are not supported
-Y2GN      # Anchors are not supported
-Y79Y/001  # Block scalars ('|', '>') are not supported
-Y79Y/002  # Flow collections are not supported (only empty [] and {})
-YD5X      # Flow collections are not supported (only empty [] and {})
-Z67P      # Block scalars ('|', '>') are not supported
+Z67P      # Tags are not supported
 Z9M4      # %TAG directives are not supported
-ZF4X      # Flow collections are not supported (only empty [] and {})
-ZH7C      # Anchors are not supported
-ZK9H      # Flow collections are not supported (only empty [] and {})
 ZWK4      # Complex mapping keys are not supported

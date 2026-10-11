@@ -65,7 +65,8 @@ That means the library is intentionally conservative today, with room to grow la
 - enums
 - arrays
 - `Collection`, `List`, `Set`, `SortedSet`, `Queue`, `Deque` and concrete collection classes
-- `Map<String, ?>`, `SortedMap<String, ?>` and concrete map classes
+- `Map<K, ?>`, `SortedMap<K, ?>`, `EnumMap` and concrete map classes, where `K` is `String`, an enum,
+  a boolean, a character, a number or one of the JDK value types below (keys are written as scalars)
 - `Object` (untyped: maps, lists, strings, booleans, `Integer`/`Long`/`BigInteger`, `Double`)
 - `Optional`
 - `UUID`, `URI`, `Path`, `File`, `Instant`, `LocalDate`, `LocalTime`, `LocalDateTime`, `OffsetDateTime`,
@@ -114,7 +115,7 @@ These are currently rejected or intentionally left disabled:
 - anchor resolution during Java binding
 - custom tags for object construction
 - implicit polymorphic deserialization
-- arbitrary non-scalar mapping keys in Java binding
+- non-scalar mapping keys and map keys of other Java types
 - full YAML 1.2 grammar coverage
 
 This is by design, not an accidental omission.
@@ -420,6 +421,7 @@ YamlMapper mapper = YamlMapper.builder()
     .writeNulls(false)
     .failOnUnknownProperties(true)
     .defaultInclusion(YamlInclude.Include.NON_NULL)
+    .coerceQuotedScalars(false)
     .processingLimits(new YamlProcessingLimits(
         64,      // maxDepth
         64,      // maxAliases
@@ -429,6 +431,10 @@ YamlMapper mapper = YamlMapper.builder()
     ))
     .build();
 ```
+
+`coerceQuotedScalars` controls whether quoted values such as `"8080"` or `"true"` may be read into
+numeric and boolean targets. It is enabled by default; disable it to require unquoted values, as the
+YAML 1.2 core schema does.
 
 ### Processing limits
 
@@ -578,6 +584,12 @@ Run the tests:
 ```bash
 mvn test
 ```
+
+`mvn verify` additionally runs the build checks used in CI:
+
+- Maven Enforcer: JDK 21+, Maven 3.9+ and pinned plugin versions
+- JaCoCo: coverage report in `target/site/jacoco` and minimum line/branch coverage
+- SpotBugs: static analysis, with justified exclusions in `spotbugs-exclude.xml`
 
 ## Limitations
 

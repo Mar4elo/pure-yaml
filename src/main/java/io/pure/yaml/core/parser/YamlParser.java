@@ -13,9 +13,14 @@ import io.pure.yaml.core.model.YamlScalarStyle;
 import io.pure.yaml.core.model.YamlSequence;
 import io.pure.yaml.core.model.YamlStream;
 
+/**
+ * Parses one YAML text. An instance may be used for several {@code parse}/{@code parseStream} calls,
+ * each of which starts from the beginning of the text; instances are not thread-safe.
+ */
 public final class YamlParser {
-    private final List<Line> lines;
+    private final String text;
     private final YamlProcessingLimits limits;
+    private List<Line> lines;
     private int index;
     private int aliasCount;
 
@@ -25,11 +30,12 @@ public final class YamlParser {
         if (text.length() > limits.maxCharacters()) {
             throw new YamlParseException("YAML input exceeds configured size limit");
         }
+        this.text = text;
         this.limits = limits;
-        this.lines = tokenize(text);
     }
 
     public YamlDocument parse() {
+        reset();
         YamlDocument document = parseDocument();
         if (!atEnd()) {
             throw new YamlParseException(
@@ -40,6 +46,7 @@ public final class YamlParser {
     }
 
     public YamlStream parseStream() {
+        reset();
         YamlStream stream = new YamlStream();
         do {
             if (stream.documents().size() >= limits.maxDocuments()) {
@@ -48,6 +55,13 @@ public final class YamlParser {
             stream.add(parseDocument());
         } while (!atEnd());
         return stream;
+    }
+
+    private void reset() {
+        // Sequence entries rewrite lines in place, so every run needs a fresh copy.
+        lines = tokenize(text);
+        index = 0;
+        aliasCount = 0;
     }
 
     private YamlDocument parseDocument() {
@@ -64,8 +78,12 @@ public final class YamlParser {
         if (index < lines.size()) {
             Line line = current();
             if (isDocumentEnd(line)) {
-                ensureNothingAfterMarker(line);
-                index++;
+                // A document may be followed by several "..." lines; all of them belong to it.
+                while (index < lines.size() && isDocumentEnd(current())) {
+                    ensureNothingAfterMarker(current());
+                    index++;
+                    skipIgnorable();
+                }
             } else if (!isDocumentStart(line)) {
                 throw new YamlParseException("Unexpected content at line " + line.lineNumber());
             }

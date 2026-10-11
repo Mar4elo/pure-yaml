@@ -17,6 +17,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -430,6 +431,14 @@ class YamlMapperTest {
     }
 
     @Test
+    void readsEmptyAndNullDocumentsAsYamlNodes() {
+        assertInstanceOf(YamlScalar.class, mapper.readValue("", YamlNode.class));
+        assertEquals("null", mapper.readValue("null", YamlScalar.class).value());
+        assertNull(mapper.readValue("", String.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("null", YamlMapping.class));
+    }
+
+    @Test
     void readsPrimitiveTargetsAndRawOptionals() {
         assertEquals(5, mapper.readValue("5", int.class));
         assertEquals(Optional.of("x"), mapper.readValue("value: x", RawOptional.class).value());
@@ -490,11 +499,70 @@ class YamlMapperTest {
     }
 
     @Test
+    void supportsScalarMapKeyTypes() {
+        EnumMap<Status, Integer> byStatus = new EnumMap<>(Status.class);
+        byStatus.put(Status.ACTIVE, 1);
+        KeyedMaps maps = new KeyedMaps(
+            byStatus,
+            new TreeMap<>(Map.of(10, "ten", -1, "minus one")),
+            Map.of(true, "yes"),
+            Map.of(UUID.fromString("123e4567-e89b-12d3-a456-426614174000"), 'x'),
+            Map.of(LocalDate.of(2026, 10, 11), 0.5)
+        );
+        String yaml = mapper.writeValueAsString(maps);
+        assertTrue(yaml.contains("byStatus:\n  ACTIVE: 1"));
+        assertTrue(yaml.contains("byNumber:\n  -1: \"minus one\"\n  10: \"ten\""));
+        KeyedMaps roundTrip = mapper.readValue(yaml, KeyedMaps.class);
+        assertEquals(maps, roundTrip);
+        assertInstanceOf(EnumMap.class, roundTrip.byStatus());
+    }
+
+    @Test
+    void rejectsInvalidOrCollidingMapKeys() {
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("byNumber:\n  x: a", NumberKeys.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("byNumber:\n  null: a", NumberKeys.class));
+        YamlMappingException duplicate = assertThrows(
+            YamlMappingException.class,
+            () -> mapper.readValue("byNumber:\n  1: a\n  01: b", NumberKeys.class)
+        );
+        assertTrue(duplicate.getMessage().contains("Duplicate map key"));
+        assertThrows(YamlMappingException.class, () -> mapper.writeValueAsString(Map.of(new Object(), 1)));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("a: 1", new YamlTypeRef<Map<Object[], Integer>>() {
+        }));
+    }
+
+    @Test
+    void canRequireUnquotedBooleansAndNumbers() {
+        assertEquals(8080, mapper.readValue("value: \"8080\"", IntHolder.class).value());
+
+        YamlMapper strict = YamlMapper.builder().coerceQuotedScalars(false).build();
+        assertEquals(8080, strict.readValue("value: 8080", IntHolder.class).value());
+        YamlMappingException quoted = assertThrows(YamlMappingException.class, () -> strict.readValue("value: \"8080\"", IntHolder.class));
+        assertTrue(quoted.getMessage().contains("Expected an unquoted scalar at $.value"));
+        assertThrows(YamlMappingException.class, () -> strict.readValue("enabled: 'true'\ndisabled: false\nnote: x", Flags.class));
+
+        User user = new User("Ann", 30, List.of("admin"));
+        assertEquals(user, strict.readValue(strict.writeValueAsString(user), User.class));
+    }
+
+    @Test
     void preservesBigDecimalPrecisionAndScale() {
         BigDecimalHolder holder = new BigDecimalHolder(new BigDecimal("1E+100"));
         String yaml = mapper.writeValueAsString(holder);
         assertEquals("value: 1E+100", yaml);
         assertEquals(holder, mapper.readValue(yaml, BigDecimalHolder.class));
+    }
+
+    record KeyedMaps(
+        EnumMap<Status, Integer> byStatus,
+        TreeMap<Integer, String> byNumber,
+        Map<Boolean, String> byFlag,
+        Map<UUID, Character> byId,
+        Map<LocalDate, Double> byDate
+    ) {
+    }
+
+    record NumberKeys(Map<Integer, String> byNumber) {
     }
 
     record Team(List<User> members, List<List<String>> matrix, Map<String, String> labels) {
@@ -560,7 +628,7 @@ class YamlMapperTest {
         }
     }
 
-    @SuppressWarnings({"rawtypes", "OptionalUsedAsFieldOrParameterType"})
+    @SuppressWarnings("rawtypes")
     record RawOptional(Optional value) {
     }
 

@@ -10,6 +10,7 @@ public final class YamlMapperBuilder {
     private boolean failOnUnknownProperties = true;
     private YamlInclude.Include defaultInclusion = YamlInclude.Include.ALWAYS;
     private YamlProcessingLimits processingLimits = YamlProcessingLimits.defaults();
+    private boolean coerceQuotedScalars = true;
 
     public YamlMapperBuilder writeNulls(boolean writeNulls) {
         this.writeNulls = writeNulls;
@@ -31,7 +32,22 @@ public final class YamlMapperBuilder {
         return this;
     }
 
+    /**
+     * Whether quoted scalars such as {@code "8080"} or {@code "true"} may be read into numeric and boolean targets.
+     * Enabled by default; disable it to require unquoted values, as the YAML 1.2 core schema does.
+     */
+    public YamlMapperBuilder coerceQuotedScalars(boolean coerceQuotedScalars) {
+        this.coerceQuotedScalars = coerceQuotedScalars;
+        return this;
+    }
+
     public YamlMapper build() {
-        return new YamlMapper(new YamlMapperConfig(writeNulls, failOnUnknownProperties, defaultInclusion, processingLimits));
+        return new YamlMapper(new YamlMapperConfig(
+            writeNulls,
+            failOnUnknownProperties,
+            defaultInclusion,
+            processingLimits,
+            coerceQuotedScalars
+        ));
     }
 }

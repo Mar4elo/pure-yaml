@@ -14,6 +14,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -106,6 +107,7 @@ public final class YamlMapper {
     }
 
     public <T> T readValue(YamlNode node, Class<T> type) {
+        Objects.requireNonNull(type, "type");
         @SuppressWarnings("unchecked")
         Class<T> boxedType = (Class<T>) MethodType.methodType(type).wrap().returnType();
         return boxedType.cast(readValue(node, (Type) type));
@@ -200,12 +202,33 @@ public final class YamlMapper {
     private YamlMapping mapToYaml(Map<?, ?> map, IdentityHashMap<Object, Boolean> activeObjects) {
         YamlMapping mapping = new YamlMapping();
         for (Map.Entry<?, ?> entry : map.entrySet()) {
-            if (!(entry.getKey() instanceof String key)) {
-                throw new YamlMappingException("Current Java binding supports only Map<String, ?>");
+            String key = mapKeyToYaml(entry.getKey());
+            if (mapping.containsKey(key)) {
+                throw new YamlMappingException("Map keys collide after conversion to YAML: " + abbreviate(key));
             }
             mapping.put(key, toYamlNodeInternal(entry.getValue(), activeObjects));
         }
         return mapping;
+    }
+
+    private static String mapKeyToYaml(Object key) {
+        if (key instanceof String string) {
+            return string;
+        }
+        if (key instanceof Enum<?> enumValue) {
+            return enumValue.name();
+        }
+        if (key instanceof Number number) {
+            return numberToYaml(number);
+        }
+        if (key instanceof Boolean || key instanceof Character) {
+            return key.toString();
+        }
+        ValueTypes.Codec codec = key == null ? null : ValueTypes.forValue(key);
+        if (codec != null) {
+            return codec.formatter().apply(key);
+        }
+        throw new YamlMappingException("Unsupported map key: " + (key == null ? "null" : key.getClass().getName()));
     }
 
     private YamlSequence collectionToYaml(Collection<?> collection, IdentityHashMap<Object, Boolean> activeObjects) {
@@ -237,6 +260,10 @@ public final class YamlMapper {
             return number.toString();
         }
         if (number instanceof BigDecimal decimal) {
+            // toPlainString() expands the exponent, which is unbounded work for values such as 1E-100000000.
+            if (Math.abs((long) decimal.scale()) > 64) {
+                return decimal.toString();
+            }
             String plain = decimal.toPlainString();
             return plain.length() <= 64 ? plain : decimal.toString();
         }
@@ -252,6 +279,12 @@ public final class YamlMapper {
         }
 
         Class<?> rawClass = Types.rawClass(type);
+        if (YamlNode.class.isAssignableFrom(rawClass)) {
+            if (!rawClass.isInstance(node)) {
+                throw new YamlMappingException("Expected " + rawClass.getSimpleName() + " at " + path);
+            }
+            return node;
+        }
         if (isNullNode(node)) {
             if (rawClass.isPrimitive()) {
                 throw new YamlMappingException("Cannot assign null to primitive at " + path);
@@ -262,12 +295,6 @@ public final class YamlMapper {
             return null;
         }
 
-        if (YamlNode.class.isAssignableFrom(rawClass)) {
-            if (!rawClass.isInstance(node)) {
-                throw new YamlMappingException("Expected " + rawClass.getSimpleName() + " at " + path);
-            }
-            return node;
-        }
         if (node instanceof YamlAlias alias) {
             throw new YamlMappingException("Alias resolution is not enabled at " + path + ": *" + alias.alias());
         }
@@ -285,7 +312,7 @@ public final class YamlMapper {
             return string.charAt(0);
         }
         if (rawClass == boolean.class || rawClass == Boolean.class) {
-            return parseBoolean(expectScalarValue(node, path), path);
+            return parseBoolean(expectTypedScalarValue(node, path), path);
         }
         if (rawClass.isEnum()) {
             return readEnum(node, rawClass, path);
@@ -448,20 +475,39 @@ public final class YamlMapper {
 
     private Object readMap(YamlNode node, Type type, Class<?> rawClass, String path) {
         YamlMapping mapping = expectMapping(node, path);
+        Type keyType = String.class;
         Type mapValueType = Object.class;
         if (type instanceof ParameterizedType parameterizedType) {
-            Class<?> keyClass = Types.rawClass(unwrapWildcard(parameterizedType.getActualTypeArguments()[0]));
-            if (keyClass != String.class && keyClass != Object.class) {
-                throw new YamlMappingException("Current Java binding supports only Map<String, ?> at " + path);
-            }
+            keyType = unwrapWildcard(parameterizedType.getActualTypeArguments()[0]);
             mapValueType = unwrapWildcard(parameterizedType.getActualTypeArguments()[1]);
         }
-        Map<String, Object> result = instantiateMap(rawClass);
+        Class<?> keyClass = Types.rawClass(keyType);
+        boolean textKeys = keyClass == String.class || keyClass == Object.class;
+        if (!textKeys && !isSupportedMapKey(keyClass)) {
+            throw new YamlMappingException("Unsupported map key type " + keyClass.getName() + " at " + path);
+        }
+        Map<Object, Object> result = instantiateMap(rawClass, keyClass);
         for (YamlEntry entry : mapping.entries()) {
-            String key = scalarKey(entry.key(), path);
-            result.put(key, readValueInternal(entry.value(), mapValueType, path + "." + key));
+            String keyText = scalarKey(entry.key(), path);
+            String entryPath = path + "." + keyText;
+            Object key = textKeys ? keyText : readValueInternal(entry.key(), keyType, entryPath);
+            if (key == null) {
+                throw new YamlMappingException("Null map key at " + entryPath);
+            }
+            if (result.containsKey(key)) {
+                throw new YamlMappingException("Duplicate map key after conversion at " + entryPath);
+            }
+            result.put(key, readValueInternal(entry.value(), mapValueType, entryPath));
         }
         return result;
+    }
+
+    private static boolean isSupportedMapKey(Class<?> keyClass) {
+        return keyClass.isEnum()
+            || keyClass == Boolean.class
+            || keyClass == Character.class
+            || Number.class.isAssignableFrom(keyClass)
+            || ValueTypes.forType(keyClass) != null;
     }
 
     private Object readEnum(YamlNode node, Class<?> rawClass, String path) {
@@ -488,7 +534,7 @@ public final class YamlMapper {
     }
 
     private Object readNumber(YamlNode node, Class<?> rawClass, String path) {
-        String lexical = expectScalarValue(node, path);
+        String lexical = expectTypedScalarValue(node, path);
         checkNumberLength(lexical, path);
         Class<?> type = MethodType.methodType(rawClass).wrap().returnType();
         try {
@@ -591,15 +637,21 @@ public final class YamlMapper {
         return decimal;
     }
 
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> instantiateMap(Class<?> rawClass) {
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Map<Object, Object> instantiateMap(Class<?> rawClass, Class<?> keyClass) {
         if (rawClass.isAssignableFrom(LinkedHashMap.class)) {
             return new LinkedHashMap<>();
         }
         if (rawClass.isAssignableFrom(TreeMap.class)) {
             return new TreeMap<>();
         }
-        return (Map<String, Object>) instantiate(rawClass, "map");
+        if (rawClass == EnumMap.class) {
+            if (!keyClass.isEnum()) {
+                throw new YamlMappingException("EnumMap requires an enum key type, got " + keyClass.getName());
+            }
+            return new EnumMap(keyClass.asSubclass(Enum.class));
+        }
+        return (Map<Object, Object>) instantiate(rawClass, "map");
     }
 
     @SuppressWarnings("unchecked")
@@ -708,6 +760,17 @@ public final class YamlMapper {
             throw new YamlMappingException("Expected scalar at " + path);
         }
         return scalar.value();
+    }
+
+    /**
+     * Reads a scalar for a boolean or numeric target; quoted scalars are accepted only when coercion is enabled.
+     */
+    private String expectTypedScalarValue(YamlNode node, String path) {
+        String value = expectScalarValue(node, path);
+        if (!config.coerceQuotedScalars() && ((YamlScalar) node).style() != YamlScalarStyle.PLAIN) {
+            throw new YamlMappingException("Expected an unquoted scalar at " + path + ", got quoted: " + abbreviate(value));
+        }
+        return value;
     }
 
     private boolean parseBoolean(String lexical, String path) {

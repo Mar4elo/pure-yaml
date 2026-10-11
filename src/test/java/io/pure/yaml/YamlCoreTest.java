@@ -235,6 +235,22 @@ class YamlCoreTest {
     }
 
     @Test
+    void acceptsRepeatedDocumentEndMarkers() {
+        YamlMapping mapping = (YamlMapping) Yaml.parse("a: 1\n...\n# trailing\n...\n");
+        assertEquals("1", scalar(mapping.get("a")));
+        assertEquals(2, Yaml.parseStream("a: 1\n...\n...\n---\nb: 2", new YamlProcessingLimits(8, 8, 2, 100)).documents().size());
+    }
+
+    @Test
+    void parserInstanceCanBeReused() {
+        YamlParser parser = new YamlParser("- a: 1\n  b: *x\n- c", new YamlProcessingLimits(8, 1, 2, 100));
+        YamlNode first = parser.parse().root();
+        YamlNode second = parser.parse().root();
+        assertEquals(Yaml.stringify(first), Yaml.stringify(second));
+        assertEquals(1, parser.parseStream().documents().size());
+    }
+
+    @Test
     void readsEmptyDocumentAsNull() {
         assertNull(scalar(Yaml.parse("")));
         assertNull(scalar(Yaml.parse("# only a comment\n---\n")));

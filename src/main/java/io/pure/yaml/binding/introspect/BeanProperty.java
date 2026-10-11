@@ -4,6 +4,9 @@ import java.lang.reflect.Type;
 
 import io.pure.yaml.annotation.YamlInclude;
 
+/**
+ * @param include explicit inclusion rule, or {@code null} when the mapper default applies
+ */
 public record BeanProperty(
     String yamlName,
     String javaName,

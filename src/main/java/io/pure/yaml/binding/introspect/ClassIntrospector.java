@@ -2,14 +2,17 @@ package io.pure.yaml.binding.introspect;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InaccessibleObjectException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.RecordComponent;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+
 import io.pure.yaml.annotation.YamlCreator;
 import io.pure.yaml.annotation.YamlIgnore;
 import io.pure.yaml.annotation.YamlInclude;
@@ -26,7 +29,14 @@ public final class ClassIntrospector {
     };
 
     public BeanDescriptor describe(Class<?> type) {
-        return cache.get(type);
+        try {
+            return cache.get(type);
+        } catch (InaccessibleObjectException exception) {
+            throw new YamlMappingException(
+                "Type " + type.getName() + " is not accessible for reflection-based binding; register a TypeAdapter for it",
+                exception
+            );
+        }
     }
 
     private BeanDescriptor inspect(Class<?> type) {
@@ -64,6 +74,9 @@ public final class ClassIntrospector {
             accessor.setAccessible(true);
             String yamlName = propertyName(component.getName(), component.getAnnotation(YamlProperty.class));
             YamlInclude.Include include = includeRule(component.getAnnotation(YamlInclude.class), type.getAnnotation(YamlInclude.class));
+            if (properties.containsKey(yamlName)) {
+                throw duplicateProperty(type, yamlName);
+            }
             properties.put(yamlName, new BeanProperty(
                 yamlName,
                 component.getName(),
@@ -78,6 +91,7 @@ public final class ClassIntrospector {
 
     private Map<String, BeanProperty> inspectPojo(Class<?> type) {
         LinkedHashMap<String, BeanProperty> properties = new LinkedHashMap<>();
+        Map<String, Class<?>> declaringClasses = new HashMap<>();
         for (Field field : collectFields(type)) {
             if (Modifier.isStatic(field.getModifiers()) || Modifier.isTransient(field.getModifiers()) || field.isSynthetic()) {
                 continue;
@@ -87,12 +101,20 @@ public final class ClassIntrospector {
             }
             field.setAccessible(true);
             String yamlName = propertyName(field.getName(), field.getAnnotation(YamlProperty.class));
+            Class<?> declaredBy = declaringClasses.putIfAbsent(yamlName, field.getDeclaringClass());
+            if (declaredBy == field.getDeclaringClass()) {
+                throw duplicateProperty(type, yamlName);
+            }
+            if (declaredBy != null) {
+                // Shadowed by a subclass field with the same YAML name.
+                continue;
+            }
             YamlInclude.Include include = includeRule(field.getAnnotation(YamlInclude.class), type.getAnnotation(YamlInclude.class));
             Method getter = findGetter(type, field);
             Method setter = findSetter(type, field);
             BeanProperty.Accessor accessor = getter != null ? target -> invoke(getter, target) : target -> getField(field, target);
             BeanProperty.Mutator mutator = setter != null ? (target, value) -> invokeSetter(setter, target, value) : (target, value) -> setField(field, target, value);
-            properties.putIfAbsent(yamlName, new BeanProperty(
+            properties.put(yamlName, new BeanProperty(
                 yamlName,
                 field.getName(),
                 field.getGenericType(),
@@ -112,7 +134,8 @@ public final class ClassIntrospector {
             for (int i = 0; i < components.length; i++) {
                 constructorTypes[i] = components[i].getType();
                 String yamlName = propertyName(components[i].getName(), components[i].getAnnotation(YamlProperty.class));
-                parameters.add(new CreatorDescriptor.CreatorParameter(yamlName, components[i].getGenericType()));
+                boolean ignored = components[i].isAnnotationPresent(YamlIgnore.class);
+                parameters.add(new CreatorDescriptor.CreatorParameter(yamlName, components[i].getGenericType(), ignored));
             }
             Constructor<?> constructor = type.getDeclaredConstructor(constructorTypes);
             constructor.setAccessible(true);
@@ -135,8 +158,10 @@ public final class ClassIntrospector {
             List<CreatorDescriptor.CreatorParameter> parameters = new ArrayList<>();
             for (Parameter parameter : creator.getParameters()) {
                 YamlProperty yamlProperty = parameter.getAnnotation(YamlProperty.class);
-                String yamlName = yamlProperty != null ? yamlProperty.value() : parameter.getName();
-                parameters.add(new CreatorDescriptor.CreatorParameter(yamlName, parameter.getParameterizedType()));
+                String yamlName = yamlProperty != null
+                    ? yamlProperty.value()
+                    : parameter.isNamePresent() ? parameter.getName() : null;
+                parameters.add(new CreatorDescriptor.CreatorParameter(yamlName, parameter.getParameterizedType(), false));
             }
             return new CreatorDescriptor(parameters, args -> {
                 try {
@@ -229,7 +254,11 @@ public final class ClassIntrospector {
         if (onType != null) {
             return onType.value();
         }
-        return YamlInclude.Include.ALWAYS;
+        return null;
+    }
+
+    private static YamlMappingException duplicateProperty(Class<?> type, String yamlName) {
+        return new YamlMappingException("Duplicate YAML property '" + yamlName + "' in " + type.getName());
     }
 
     private static String capitalize(String value) {

@@ -24,10 +24,11 @@ RFC 9512 does not redefine the whole YAML language. Instead, it registers the `a
 
 This project takes that seriously and starts from a safer subset first:
 
-- single-document input
+- single-document input by default (multi-document streams only through `parseStream` with an explicit limit)
 - block-style collections
 - no implicit object construction
-- no custom tag resolution
+- no custom tag resolution: tags, anchors and other unsupported syntax are rejected instead of being read as text
+- duplicate mapping keys are rejected
 - alias nodes are parsed, but alias resolution is not enabled for Java object binding
 
 That means the library is intentionally conservative today, with room to grow later.
@@ -44,10 +45,12 @@ That means the library is intentionally conservative today, with room to grow la
 - YAML writer
 - Java object mapper
 - records and POJOs
-- generic collections via `YamlTypeRef`
+- generic collections and generic beans via `YamlTypeRef`
+- untyped binding to `Object`, `Map<String, Object>` and `List<Object>` using the YAML 1.2 core schema
+- common JDK value types (`UUID`, `URI`, `Path`, `java.time` types, `Locale`, ...)
 - custom adapters via `TypeAdapter`
 - annotations for naming, ignoring, creators, inclusion, and projected scalar values
-- configurable processing limits
+- configurable processing limits, including limits on numeric literals
 - cycle detection during object serialization
 - cycle detection during YAML graph writing
 
@@ -56,41 +59,57 @@ That means the library is intentionally conservative today, with room to grow la
 - `String`
 - `char` / `Character`
 - `boolean` / `Boolean`
-- primitive numeric types and boxed numeric types
+- primitive numeric types and boxed numeric types (decimal, `0x` hexadecimal, `0o` octal, `.inf`, `.nan`)
 - `BigDecimal`
 - `BigInteger`
 - enums
 - arrays
-- `Collection`, `List`, `Set`
-- `Map<String, ?>`
+- `Collection`, `List`, `Set`, `SortedSet`, `Queue`, `Deque` and concrete collection classes
+- `Map<String, ?>`, `SortedMap<String, ?>` and concrete map classes
+- `Object` (untyped: maps, lists, strings, booleans, `Integer`/`Long`/`BigInteger`, `Double`)
 - `Optional`
-- Java records
-- POJOs with no-args constructor or `@YamlCreator`
+- `UUID`, `URI`, `Path`, `File`, `Instant`, `LocalDate`, `LocalTime`, `LocalDateTime`, `OffsetDateTime`,
+  `OffsetTime`, `ZonedDateTime`, `Duration`, `Period`, `Year`, `YearMonth`, `MonthDay`, `ZoneId`, `ZoneOffset`,
+  `Locale`, `Currency`, `Charset` (written as strings)
+- Java records, including generic records
+- POJOs with no-args constructor or `@YamlCreator`, including generic classes and generic superclasses
+
+Other JDK types that are not accessible through reflection are rejected with a `YamlMappingException`;
+register a `TypeAdapter` for them.
 
 ## What Is Supported Today
 
 The current parser/writer supports a safe, practical subset of YAML:
 
-- single YAML document
-- `%YAML 1.2` directive
+- single YAML document (`Yaml.parse`), or several documents through `Yaml.parseStream` within `maxDocuments`
+- `%YAML 1.x` directive
 - document start marker `---`
 - document end marker `...`
-- block mappings
-- block sequences
+- block mappings and block sequences with any consistent indentation
+- compact sequences under a mapping key (`key:` followed by `- item` at the same indentation)
+- nested sequence entries on one line (`- - item`, `- key: value`)
+- empty values (`key:` or `-`), read as null
+- empty flow collections `[]` and `{}`
 - scalar mapping keys
 - plain scalars
 - single-quoted scalars
-- double-quoted scalars with a small supported escape set
+- double-quoted scalars with the full YAML escape set (`\0`, `\n`, `\t`, `\xXX`, `\uXXXX`, `\UXXXXXXXX`, ...)
 - comments
 - UTF-8 text input
 - alias nodes as parsed syntax objects
+
+Input that falls outside this subset is rejected with a `YamlParseException` that names the line.
+The parser never silently skips or reinterprets content.
 
 ## What Is Intentionally Not Supported Yet
 
 These are currently rejected or intentionally left disabled:
 
-- multi-document streams
-- flow collections like `[1, 2]` and `{a: 1}`
+- multi-document streams in `parse()` (use `parseStream()` with an explicit `maxDocuments`)
+- non-empty flow collections like `[1, 2]` and `{a: 1}`
+- block scalars (`|`, `>`) and multi-line plain or quoted scalars
+- anchors (`&name`), tags (`!tag`) and `%TAG` directives
+- complex mapping keys (`? key`)
 - merge keys
 - anchor resolution during Java binding
 - custom tags for object construction
@@ -262,7 +281,8 @@ record Account(
 
 ### `@YamlIgnore`
 
-Exclude a field or record component from binding:
+Exclude a field or record component from binding. Ignored record components are not read from YAML
+either: the constructor receives `null` (or the primitive default), and the key is treated as unknown.
 
 ```java
 import io.pure.yaml.annotation.YamlIgnore;
@@ -277,7 +297,10 @@ final class Credentials {
 
 ### `@YamlCreator`
 
-Choose a constructor for POJO creation:
+Choose a constructor for POJO creation. Parameter names come from `@YamlProperty` or, when the
+code is compiled with `-parameters`, from the compiler. Without either, reading fails with a clear
+error instead of silently passing `null`. Values passed to the creator are not overwritten afterwards,
+so validation and normalization in the constructor are preserved.
 
 ```java
 import io.pure.yaml.annotation.YamlCreator;
@@ -300,7 +323,9 @@ final class Person {
 
 ### `@YamlInclude`
 
-Skip `null` values during serialization:
+Skip `null` values during serialization. An explicit annotation on a field or type takes precedence
+over `YamlMapperBuilder.defaultInclusion`, so `@YamlInclude(ALWAYS)` keeps a property even when the
+default is `NON_NULL`:
 
 ```java
 import io.pure.yaml.annotation.YamlInclude;
@@ -372,6 +397,10 @@ mapper.registerAdapter(Token.class, new TypeAdapter<Token>() {
 });
 ```
 
+When writing, an adapter registered for a class or interface also applies to its subtypes, and it takes
+precedence over built-in handling (including `String`, numbers and collections). When reading, an adapter
+applies to the exact target type or its raw class.
+
 The mapper also exposes lifecycle helpers:
 
 - `registerAdapter(Type, TypeAdapter<?>)`
@@ -395,7 +424,8 @@ YamlMapper mapper = YamlMapper.builder()
         64,      // maxDepth
         64,      // maxAliases
         1,       // maxDocuments
-        500_000  // maxCharacters
+        500_000, // maxCharacters
+        1_000    // maxNumberLength
     ))
     .build();
 ```
@@ -408,8 +438,11 @@ YamlMapper mapper = YamlMapper.builder()
 - `maxAliases`
 - `maxDocuments`
 - `maxCharacters`
+- `maxNumberLength`: maximum length of a numeric literal and maximum magnitude (in digits) of
+  `BigInteger`/`BigDecimal` values, which protects against inputs such as `1e1000000000`
 
-The defaults are conservative and suitable for many config-oriented use cases.
+The defaults are conservative and suitable for many config-oriented use cases. The parser can also
+be used with custom limits directly: `Yaml.parse(text, limits)`, `Yaml.parseStream(text, limits)`.
 
 ## Safety Model
 
@@ -421,7 +454,10 @@ This library intentionally defaults to safer behavior.
 - no alias resolution in Java binding
 - no custom object construction from tags
 - no code execution hooks
-- configurable parser limits
+- configurable parser limits, including numeric literal limits
+- duplicate mapping keys are rejected
+- unsupported syntax is rejected instead of being read as text
+- quoted `"null"` and `"~"` stay strings; only plain `null`, `Null`, `NULL`, `~` and empty values are null
 - cycle detection during serialization
 
 ### Why this matters
@@ -468,6 +504,7 @@ Low-level YAML functionality:
 Key types:
 
 - `Yaml`
+- `YamlException`
 - `YamlParser`
 - `YamlWriter`
 - `YamlNode`
@@ -501,7 +538,7 @@ Binding annotations:
 
 ## Error Handling
 
-The project uses dedicated exceptions:
+All exceptions extend `io.pure.yaml.core.YamlException`:
 
 - `YamlParseException` for syntax and parser-limit failures
 - `YamlWriteException` for invalid YAML graph writing
@@ -512,6 +549,9 @@ Typical binding errors include:
 - unknown properties
 - unsupported collection/map targets
 - invalid boolean lexemes for YAML 1.2 binding
+- invalid, out-of-range or oversized numbers
+- invalid values for JDK value types (dates, UUIDs, ...)
+- types that are not accessible through reflection
 - alias resolution attempts where disabled
 - cyclic object graphs
 
@@ -520,7 +560,10 @@ Typical binding errors include:
 The project includes tests for:
 
 - records and POJOs
-- generic collections
+- generic collections and generic beans
+- write/read round trips of nested collections, empty collections and special strings
+- randomized round trips of YAML trees and fuzzing of the parser
+- rejection of unsupported or malformed syntax
 - quoted scalars and escapes
 - YAML directives and document markers
 - BOM and comments
@@ -542,7 +585,8 @@ Before using this library in production, be aware of the current scope:
 
 - not a full YAML 1.2 implementation
 - not yet a general-purpose replacement for mature YAML libraries
-- no flow-style collection support
+- only empty flow-style collections (`[]`, `{}`)
+- no block scalars or multi-line scalars
 - no merge-key support
 - no tag-driven object model
 - no alias resolution for object binding
@@ -553,7 +597,7 @@ Before using this library in production, be aware of the current scope:
 Planned directions include:
 
 1. anchors and aliases as first-class graph resolution
-2. optional multi-document stream support
+2. flow collections, block scalars and multi-line scalars
 3. merge-key policy support
 4. broader YAML 1.2 compatibility
 5. additional performance tuning for large inputs

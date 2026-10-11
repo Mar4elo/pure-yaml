@@ -2,13 +2,30 @@ package io.pure.yaml;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.net.URI;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.junit.jupiter.api.Test;
 
@@ -200,6 +217,357 @@ class YamlMapperTest {
                     leaf: 1
                 """, YamlNode.class)
         );
+    }
+
+    @Test
+    void roundTripsNestedCollectionsOfObjects() {
+        Team team = new Team(
+            List.of(new User("Ann", 30, List.of("admin")), new User("Bob", 41, List.of())),
+            List.of(List.of("a", "b"), List.of()),
+            Map.of()
+        );
+        String yaml = mapper.writeValueAsString(team);
+        assertEquals("""
+            members:
+              - name: "Ann"
+                age: 30
+                roles:
+                  - "admin"
+              - name: "Bob"
+                age: 41
+                roles: []
+            matrix:
+              - - "a"
+                - "b"
+              - []
+            labels: {}""", yaml);
+        assertEquals(team, mapper.readValue(yaml, Team.class));
+    }
+
+    @Test
+    void keepsQuotedNullLikeStrings() {
+        for (String value : List.of("null", "~", "Null", "true", "123", "", " padded ")) {
+            Text text = mapper.readValue(mapper.writeValueAsString(new Text(value)), Text.class);
+            assertEquals(value, text.value());
+        }
+        assertNull(mapper.readValue("value: null", Text.class).value());
+        assertNull(mapper.readValue("value:", Text.class).value());
+    }
+
+    @Test
+    void roundTripsStringsWithSpecialCharacters() {
+        for (String value : List.of("say \" #hi", "it's # here", "a: b", "line\nbreak", "tab\there", "back\\slash", "- item", "*star", "\u0001")) {
+            assertEquals(value, mapper.readValue(mapper.writeValueAsString(new Text(value)), Text.class).value());
+        }
+    }
+
+    @Test
+    void writesAndReadsSpecialFloatingPointValues() {
+        Floats floats = new Floats(Double.NaN, Double.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, 0.1f);
+        String yaml = mapper.writeValueAsString(floats);
+        assertEquals("nan: .nan\npositive: .inf\nnegative: -.inf\nsmall: 0.1", yaml);
+        assertEquals(floats, mapper.readValue(yaml, Floats.class));
+    }
+
+    @Test
+    void readsYamlCoreSchemaNumbers() {
+        Numbers numbers = mapper.readValue("""
+            hex: 0x1F
+            octal: 0o17
+            exponent: 1e3
+            decimal: .5
+            """, Numbers.class);
+        assertEquals(new Numbers(31, 15L, 1000, 0.5), numbers);
+    }
+
+    @Test
+    void reportsInvalidNumbersAsMappingErrors() {
+        YamlMappingException invalid = assertThrows(YamlMappingException.class, () -> mapper.readValue("value: abc", IntHolder.class));
+        assertTrue(invalid.getMessage().contains("Invalid number at $.value"));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1.5", IntHolder.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1e999999999999", IntHolder.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1e400", DoubleHolder.class));
+    }
+
+    @Test
+    void rejectsNumbersThatAreTooExpensiveToExpand() {
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1e1000000000", BigIntegerHolder.class));
+            assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1e1000000000", BigDecimalHolder.class));
+            assertThrows(YamlMappingException.class, () -> mapper.readValue("value: 1e1000000000", IntHolder.class));
+            assertThrows(YamlMappingException.class, () -> mapper.readValue("value: " + "9".repeat(1_001), BigIntegerHolder.class));
+        });
+        assertEquals(new BigInteger("1" + "0".repeat(100)), mapper.readValue("value: 1e100", BigIntegerHolder.class).value());
+    }
+
+    @Test
+    void readsUntypedValues() {
+        Map<String, Object> values = mapper.readValue("""
+            string: text
+            quoted: "123"
+            integer: 42
+            long: 9000000000
+            big: 99999999999999999999
+            double: 1.5
+            bool: true
+            nothing: null
+            list:
+              - 1
+              - nested: x
+            """, new YamlTypeRef<Map<String, Object>>() {
+        });
+        assertEquals("text", values.get("string"));
+        assertEquals("123", values.get("quoted"));
+        assertEquals(42, values.get("integer"));
+        assertEquals(9_000_000_000L, values.get("long"));
+        assertEquals(new BigInteger("99999999999999999999"), values.get("big"));
+        assertEquals(1.5, values.get("double"));
+        assertEquals(true, values.get("bool"));
+        assertTrue(values.containsKey("nothing"));
+        assertNull(values.get("nothing"));
+        assertEquals(List.of(1, Map.of("nested", "x")), values.get("list"));
+        assertInstanceOf(LinkedHashMap.class, mapper.readValue("a: 1", Object.class));
+    }
+
+    @Test
+    void resolvesGenericBeanProperties() {
+        Box<User> box = mapper.readValue("""
+            value:
+              name: "Ann"
+              age: 30
+              roles: []
+            items:
+              - name: "Bob"
+                age: 41
+                roles: []
+            """, new YamlTypeRef<Box<User>>() {
+        });
+        assertEquals("Ann", box.value().name());
+        assertEquals("Bob", box.items().getFirst().name());
+
+        UserPage page = mapper.readValue("""
+            content:
+              - name: "Ann"
+                age: 30
+                roles: []
+            """, UserPage.class);
+        assertEquals("Ann", page.content.getFirst().name());
+
+        Box<?> raw = mapper.readValue("value: 1\nitems: []", Box.class);
+        assertEquals(1, raw.value());
+    }
+
+    @Test
+    void supportsCommonJdkValueTypes() {
+        JdkValues values = new JdkValues(
+            UUID.fromString("123e4567-e89b-12d3-a456-426614174000"),
+            URI.create("https://example.com/a?b=c"),
+            LocalDate.of(2026, 10, 11),
+            Instant.parse("2026-10-11T10:15:30Z"),
+            Duration.ofMinutes(90),
+            ZoneId.of("Europe/Paris"),
+            Locale.forLanguageTag("ru-RU")
+        );
+        String yaml = mapper.writeValueAsString(values);
+        assertTrue(yaml.contains("duration: \"PT1H30M\""));
+        assertEquals(values, mapper.readValue(yaml, JdkValues.class));
+
+        YamlMappingException invalid = assertThrows(YamlMappingException.class, () -> mapper.readValue("date: 2026-13-01", DateHolder.class));
+        assertTrue(invalid.getMessage().contains("Invalid LocalDate value at $.date"));
+    }
+
+    @Test
+    void reportsInaccessibleTypesAsMappingErrors() {
+        YamlMappingException exception = assertThrows(YamlMappingException.class, () -> mapper.writeValueAsString(new ReentrantLock()));
+        assertTrue(exception.getMessage().contains("register a TypeAdapter"));
+    }
+
+    @Test
+    void rejectsDuplicateKeys() {
+        assertThrows(io.pure.yaml.core.parser.YamlParseException.class, () -> mapper.readValue("""
+            name: "Ann"
+            age: 30
+            name: "Bob"
+            roles: []
+            """, User.class));
+    }
+
+    @Test
+    void doesNotReadIgnoredRecordComponents() {
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("user: u\nrole: admin", Secret.class));
+
+        YamlMapper lenient = YamlMapper.builder().failOnUnknownProperties(false).build();
+        Secret secret = lenient.readValue("user: u\nrole: admin\nlevel: 9", Secret.class);
+        assertEquals(new Secret("u", null, 0), secret);
+        assertEquals("user: \"u\"", mapper.writeValueAsString(new Secret("u", "admin", 9)));
+    }
+
+    @Test
+    void doesNotOverwriteCreatorResultWithReflection() {
+        Normalized normalized = mapper.readValue("""
+            name: "ann"
+            note: "kept"
+            """, Normalized.class);
+        assertEquals("ANN", normalized.name);
+        assertEquals("kept", normalized.note);
+    }
+
+    @Test
+    void usesCompiledParameterNamesForCreators() {
+        assertEquals("Ada", mapper.readValue("name: \"Ada\"", NamedByCompiler.class).name);
+    }
+
+    @Test
+    void escapesMapKeys() {
+        Map<String, Integer> map = new LinkedHashMap<>();
+        map.put("x\n- injected", 1);
+        map.put("*k", 2);
+        map.put("a: b", 3);
+        map.put("", 4);
+        String yaml = mapper.writeValueAsString(map);
+        assertEquals(map, mapper.readValue(yaml, new YamlTypeRef<Map<String, Integer>>() {
+        }));
+    }
+
+    @Test
+    void readsPrimitiveTargetsAndRawOptionals() {
+        assertEquals(5, mapper.readValue("5", int.class));
+        assertEquals(Optional.of("x"), mapper.readValue("value: x", RawOptional.class).value());
+    }
+
+    @Test
+    void appliesWriteAdaptersToSubtypesAndBuiltInTypes() {
+        YamlMapper localMapper = YamlMapper.createDefault();
+        localMapper.registerAdapter(CharSequence.class, new io.pure.yaml.binding.adapter.TypeAdapter<CharSequence>() {
+            @Override
+            public YamlNode toYaml(CharSequence value, YamlMapper mapper) {
+                return YamlScalar.plain(value.toString().toUpperCase(Locale.ROOT));
+            }
+
+            @Override
+            public CharSequence fromYaml(YamlNode node, java.lang.reflect.Type type, YamlMapper mapper, String path) {
+                return ((YamlScalar) node).value();
+            }
+        });
+        assertEquals("value: ABC", localMapper.writeValueAsString(new Text("abc")));
+
+        localMapper.registerAdapter(List.class, new io.pure.yaml.binding.adapter.TypeAdapter<List<?>>() {
+            @Override
+            public YamlNode toYaml(List<?> value, YamlMapper mapper) {
+                return YamlScalar.plain(String.valueOf(value.size()));
+            }
+
+            @Override
+            public List<?> fromYaml(YamlNode node, java.lang.reflect.Type type, YamlMapper mapper, String path) {
+                return List.of(((YamlScalar) node).value());
+            }
+        });
+        assertEquals(List.of("3"), localMapper.readValue("3", new YamlTypeRef<List<String>>() {
+        }));
+    }
+
+    @Test
+    void explicitAlwaysOverridesNonNullDefault() {
+        YamlMapper nonNull = YamlMapper.builder().defaultInclusion(YamlInclude.Include.NON_NULL).build();
+        assertEquals("always: null", nonNull.writeValueAsString(new Inclusion(null, null)));
+    }
+
+    @Test
+    void instantiatesSpecificCollectionAndMapTypes() {
+        SpecificTypes types = mapper.readValue("""
+            sorted:
+              - b
+              - a
+            queue:
+              - 1
+            tree:
+              b: 2
+              a: 1
+            """, SpecificTypes.class);
+        assertEquals(List.of("a", "b"), List.copyOf(types.sorted()));
+        assertEquals(1, types.queue().getFirst());
+        assertEquals(List.of("a", "b"), List.copyOf(types.tree().keySet()));
+    }
+
+    @Test
+    void preservesBigDecimalPrecisionAndScale() {
+        BigDecimalHolder holder = new BigDecimalHolder(new BigDecimal("1E+100"));
+        String yaml = mapper.writeValueAsString(holder);
+        assertEquals("value: 1E+100", yaml);
+        assertEquals(holder, mapper.readValue(yaml, BigDecimalHolder.class));
+    }
+
+    record Team(List<User> members, List<List<String>> matrix, Map<String, String> labels) {
+    }
+
+    record Text(String value) {
+    }
+
+    record Floats(double nan, double positive, float negative, float small) {
+    }
+
+    record Numbers(int hex, long octal, int exponent, double decimal) {
+    }
+
+    record IntHolder(int value) {
+    }
+
+    record DoubleHolder(double value) {
+    }
+
+    record BigIntegerHolder(BigInteger value) {
+    }
+
+    record BigDecimalHolder(BigDecimal value) {
+    }
+
+    record Box<T>(T value, List<T> items) {
+    }
+
+    static class Page<T> {
+        List<T> content;
+    }
+
+    static final class UserPage extends Page<User> {
+    }
+
+    record JdkValues(UUID id, URI uri, LocalDate date, Instant instant, Duration duration, ZoneId zone, Locale locale) {
+    }
+
+    record DateHolder(LocalDate date) {
+    }
+
+    record Secret(String user, @YamlIgnore String role, @YamlIgnore int level) {
+    }
+
+    static final class Normalized {
+        @YamlProperty("name")
+        private final String name;
+        private String note;
+
+        @YamlCreator
+        Normalized(@YamlProperty("name") String name) {
+            this.name = name.toUpperCase(Locale.ROOT);
+        }
+    }
+
+    static final class NamedByCompiler {
+        private final String name;
+
+        @YamlCreator
+        NamedByCompiler(String name) {
+            this.name = name;
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "OptionalUsedAsFieldOrParameterType"})
+    record RawOptional(Optional value) {
+    }
+
+    record Inclusion(@YamlInclude(YamlInclude.Include.ALWAYS) String always, String other) {
+    }
+
+    record SpecificTypes(SortedSet<String> sorted, Deque<Integer> queue, TreeMap<String, Integer> tree) {
     }
 
     record User(String name, int age, List<String> roles) {

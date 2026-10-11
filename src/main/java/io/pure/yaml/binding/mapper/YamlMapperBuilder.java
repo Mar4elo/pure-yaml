@@ -1,5 +1,7 @@
 package io.pure.yaml.binding.mapper;
 
+import java.util.Objects;
+
 import io.pure.yaml.annotation.YamlInclude;
 import io.pure.yaml.core.parser.YamlProcessingLimits;
 
@@ -20,12 +22,12 @@ public final class YamlMapperBuilder {
     }
 
     public YamlMapperBuilder defaultInclusion(YamlInclude.Include defaultInclusion) {
-        this.defaultInclusion = defaultInclusion;
+        this.defaultInclusion = Objects.requireNonNull(defaultInclusion, "defaultInclusion");
         return this;
     }
 
     public YamlMapperBuilder processingLimits(YamlProcessingLimits processingLimits) {
-        this.processingLimits = processingLimits;
+        this.processingLimits = Objects.requireNonNull(processingLimits, "processingLimits");
         return this;
     }
 

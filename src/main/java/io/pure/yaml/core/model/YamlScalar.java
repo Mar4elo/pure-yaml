@@ -6,6 +6,12 @@ public record YamlScalar(
     String anchor,
     YamlScalarStyle style
 ) implements YamlNode {
+    public YamlScalar {
+        if (style == null) {
+            style = YamlScalarStyle.PLAIN;
+        }
+    }
+
     public YamlScalar(String value) {
         this(value, null, null, YamlScalarStyle.PLAIN);
     }

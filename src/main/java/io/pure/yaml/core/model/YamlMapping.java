@@ -22,10 +22,13 @@ public final class YamlMapping implements YamlNode {
     }
 
     public void put(YamlNode key, YamlNode value) {
-        entries.add(new YamlEntry(key, value));
         if (key instanceof YamlScalar scalar) {
-            scalarIndex.putIfAbsent(scalar.value(), value);
+            if (scalarIndex.containsKey(scalar.value())) {
+                throw new IllegalArgumentException("Duplicate mapping key: " + scalar.value());
+            }
+            scalarIndex.put(scalar.value(), value);
         }
+        entries.add(new YamlEntry(key, value));
     }
 
     public void put(String key, YamlNode value) {
@@ -38,6 +41,10 @@ public final class YamlMapping implements YamlNode {
 
     public boolean containsKey(String key) {
         return scalarIndex.containsKey(key);
+    }
+
+    public int size() {
+        return entries.size();
     }
 
     public List<YamlEntry> entries() {

@@ -1,12 +1,18 @@
 package io.pure.yaml.binding.mapper;
 
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -16,7 +22,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 import io.pure.yaml.annotation.YamlInclude;
 import io.pure.yaml.binding.adapter.TypeAdapter;
@@ -27,6 +37,7 @@ import io.pure.yaml.binding.introspect.CreatorDescriptor;
 import io.pure.yaml.binding.reflect.Types;
 import io.pure.yaml.core.Yaml;
 import io.pure.yaml.core.model.YamlAlias;
+import io.pure.yaml.core.model.YamlEntry;
 import io.pure.yaml.core.model.YamlMapping;
 import io.pure.yaml.core.model.YamlNode;
 import io.pure.yaml.core.model.YamlScalar;
@@ -35,6 +46,13 @@ import io.pure.yaml.core.model.YamlSequence;
 import io.pure.yaml.core.parser.YamlParser;
 
 public final class YamlMapper {
+    private static final Pattern INTEGER = Pattern.compile("[-+]?[0-9]+");
+    private static final Pattern OCTAL = Pattern.compile("0o[0-7]+");
+    private static final Pattern HEXADECIMAL = Pattern.compile("0x[0-9a-fA-F]+");
+    private static final Pattern DECIMAL = Pattern.compile("[-+]?(\\.[0-9]+|[0-9]+(\\.[0-9]*)?)([eE][-+]?[0-9]+)?");
+    private static final Pattern INFINITY = Pattern.compile("[-+]?\\.(inf|Inf|INF)");
+    private static final Pattern NOT_A_NUMBER = Pattern.compile("\\.(nan|NaN|NAN)");
+
     private final YamlMapperConfig config;
     private final ClassIntrospector introspector = new ClassIntrospector();
     private final ConcurrentHashMap<Type, TypeAdapter<?>> adapters = new ConcurrentHashMap<>();
@@ -44,7 +62,7 @@ public final class YamlMapper {
     }
 
     YamlMapper(YamlMapperConfig config) {
-        this.config = config;
+        this.config = Objects.requireNonNull(config, "config");
     }
 
     public static YamlMapper createDefault() {
@@ -55,8 +73,12 @@ public final class YamlMapper {
         return new YamlMapperBuilder();
     }
 
+    /**
+     * Registers an adapter. On write it applies to values of {@code type} and its subtypes
+     * (when {@code type} is a class); on read it applies to the exact target type or its raw class.
+     */
     public <T> void registerAdapter(Type type, TypeAdapter<T> adapter) {
-        adapters.put(type, adapter);
+        adapters.put(Objects.requireNonNull(type, "type"), Objects.requireNonNull(adapter, "adapter"));
     }
 
     public void unregisterAdapter(Type type) {
@@ -76,15 +98,17 @@ public final class YamlMapper {
     }
 
     public <T> T readValue(String yaml, Class<T> type) {
-        return readValue(new YamlParser(yaml, config.processingLimits()).parse().root(), type);
+        return readValue(parse(yaml), type);
     }
 
     public <T> T readValue(String yaml, YamlTypeRef<T> typeRef) {
-        return readValue(new YamlParser(yaml, config.processingLimits()).parse().root(), typeRef.getType());
+        return readValue(parse(yaml), typeRef.getType());
     }
 
     public <T> T readValue(YamlNode node, Class<T> type) {
-        return type.cast(readValue(node, (Type) type));
+        @SuppressWarnings("unchecked")
+        Class<T> boxedType = (Class<T>) MethodType.methodType(type).wrap().returnType();
+        return boxedType.cast(readValue(node, (Type) type));
     }
 
     @SuppressWarnings("unchecked")
@@ -92,41 +116,51 @@ public final class YamlMapper {
         return (T) readValueInternal(node, type, "$");
     }
 
-    @SuppressWarnings("unchecked")
+    private YamlNode parse(String yaml) {
+        return new YamlParser(yaml, config.processingLimits()).parse().root();
+    }
+
     private YamlNode toYamlNodeInternal(Object value, IdentityHashMap<Object, Boolean> activeObjects) {
         if (value == null) {
-            return YamlScalar.plain("null");
+            return nullScalar();
         }
-
         if (value instanceof YamlNode node) {
             return node;
         }
+        TypeAdapter<Object> adapter = findWriteAdapter(value.getClass());
+        if (adapter != null) {
+            enter(value, activeObjects);
+            try {
+                YamlNode node = adapter.toYaml(value, this);
+                return node != null ? node : nullScalar();
+            } finally {
+                activeObjects.remove(value);
+            }
+        }
         if (value instanceof String string) {
-            return new YamlScalar(string, null, null, YamlScalarStyle.DOUBLE_QUOTED);
+            return quoted(string);
         }
         if (value instanceof Character character) {
-            return new YamlScalar(String.valueOf(character), null, null, YamlScalarStyle.DOUBLE_QUOTED);
+            return quoted(String.valueOf(character));
         }
         if (value instanceof Boolean bool) {
             return YamlScalar.plain(bool ? "true" : "false");
         }
         if (value instanceof Enum<?> enumValue) {
-            return new YamlScalar(enumValue.name(), null, null, YamlScalarStyle.DOUBLE_QUOTED);
+            return quoted(enumValue.name());
         }
         if (value instanceof Number number) {
             return YamlScalar.plain(numberToYaml(number));
         }
         if (value instanceof Optional<?> optional) {
-            return optional.map(item -> toYamlNodeInternal(item, activeObjects)).orElseGet(() -> YamlScalar.plain("null"));
+            return optional.map(item -> toYamlNodeInternal(item, activeObjects)).orElseGet(YamlMapper::nullScalar);
         }
-        if (activeObjects.put(value, Boolean.TRUE) != null) {
-            throw new YamlMappingException("Cyclic object graph detected while serializing " + value.getClass().getName());
+        ValueTypes.Codec codec = ValueTypes.forValue(value);
+        if (codec != null) {
+            return quoted(codec.formatter().apply(value));
         }
+        enter(value, activeObjects);
         try {
-            TypeAdapter<Object> adapter = (TypeAdapter<Object>) adapters.get(value.getClass());
-            if (adapter != null) {
-                return adapter.toYaml(value, this);
-            }
             if (value instanceof Map<?, ?> map) {
                 return mapToYaml(map, activeObjects);
             }
@@ -136,33 +170,31 @@ public final class YamlMapper {
             if (value.getClass().isArray()) {
                 return arrayToYaml(value, activeObjects);
             }
-
-            BeanDescriptor descriptor = introspector.describe(value.getClass());
-            if (descriptor.yamlValueMethod() != null) {
-                try {
-                    return toYamlNodeInternal(descriptor.yamlValueMethod().invoke(value), activeObjects);
-                } catch (ReflectiveOperationException exception) {
-                    throw new YamlMappingException("Cannot invoke @YamlValue for " + value.getClass().getName(), exception);
-                }
-            }
-
-            YamlMapping mapping = new YamlMapping();
-            YamlInclude.Include defaultInclusion = config.defaultInclusion();
-            for (BeanProperty property : descriptor.properties().values()) {
-                Object propertyValue = property.accessor().get(value);
-                YamlInclude.Include inclusion = property.include() == YamlInclude.Include.ALWAYS ? defaultInclusion : property.include();
-                if (!config.writeNulls() && propertyValue == null) {
-                    continue;
-                }
-                if (inclusion == YamlInclude.Include.NON_NULL && propertyValue == null) {
-                    continue;
-                }
-                mapping.put(property.yamlName(), toYamlNodeInternal(propertyValue, activeObjects));
-            }
-            return mapping;
+            return beanToYaml(value, activeObjects);
         } finally {
             activeObjects.remove(value);
         }
+    }
+
+    private YamlNode beanToYaml(Object value, IdentityHashMap<Object, Boolean> activeObjects) {
+        BeanDescriptor descriptor = introspector.describe(value.getClass());
+        if (descriptor.yamlValueMethod() != null) {
+            try {
+                return toYamlNodeInternal(descriptor.yamlValueMethod().invoke(value), activeObjects);
+            } catch (ReflectiveOperationException exception) {
+                throw new YamlMappingException("Cannot invoke @YamlValue for " + value.getClass().getName(), exception);
+            }
+        }
+        YamlMapping mapping = new YamlMapping();
+        for (BeanProperty property : descriptor.properties().values()) {
+            Object propertyValue = property.accessor().get(value);
+            YamlInclude.Include inclusion = property.include() != null ? property.include() : config.defaultInclusion();
+            if (propertyValue == null && (!config.writeNulls() || inclusion == YamlInclude.Include.NON_NULL)) {
+                continue;
+            }
+            mapping.put(property.yamlName(), toYamlNodeInternal(propertyValue, activeObjects));
+        }
+        return mapping;
     }
 
     private YamlMapping mapToYaml(Map<?, ?> map, IdentityHashMap<Object, Boolean> activeObjects) {
@@ -193,27 +225,28 @@ public final class YamlMapper {
         return sequence;
     }
 
-    private String numberToYaml(Number number) {
-        if (number instanceof Double value) {
-            return BigDecimal.valueOf(value).stripTrailingZeros().toPlainString();
-        }
-        if (number instanceof Float value) {
-            return BigDecimal.valueOf(value.doubleValue()).stripTrailingZeros().toPlainString();
+    private static String numberToYaml(Number number) {
+        if (number instanceof Double || number instanceof Float) {
+            double value = number.doubleValue();
+            if (Double.isNaN(value)) {
+                return ".nan";
+            }
+            if (Double.isInfinite(value)) {
+                return value > 0 ? ".inf" : "-.inf";
+            }
+            return number.toString();
         }
         if (number instanceof BigDecimal decimal) {
-            return decimal.toPlainString();
-        }
-        if (number instanceof BigInteger integer) {
-            return integer.toString();
+            String plain = decimal.toPlainString();
+            return plain.length() <= 64 ? plain : decimal.toString();
         }
         return number.toString();
     }
 
-    @SuppressWarnings("unchecked")
     private Object readValueInternal(YamlNode node, Type type, String path) {
         Objects.requireNonNull(type, "type");
 
-        TypeAdapter<Object> adapter = (TypeAdapter<Object>) adapters.get(type);
+        TypeAdapter<Object> adapter = findReadAdapter(type);
         if (adapter != null) {
             return adapter.fromYaml(node, type, this, path);
         }
@@ -223,14 +256,23 @@ public final class YamlMapper {
             if (rawClass.isPrimitive()) {
                 throw new YamlMappingException("Cannot assign null to primitive at " + path);
             }
-            if (Optional.class.isAssignableFrom(rawClass)) {
+            if (rawClass == Optional.class) {
                 return Optional.empty();
             }
             return null;
         }
 
-        if (rawClass == YamlNode.class || YamlNode.class.isAssignableFrom(rawClass)) {
+        if (YamlNode.class.isAssignableFrom(rawClass)) {
+            if (!rawClass.isInstance(node)) {
+                throw new YamlMappingException("Expected " + rawClass.getSimpleName() + " at " + path);
+            }
             return node;
+        }
+        if (node instanceof YamlAlias alias) {
+            throw new YamlMappingException("Alias resolution is not enabled at " + path + ": *" + alias.alias());
+        }
+        if (rawClass == Object.class) {
+            return readUntyped(node, path);
         }
         if (rawClass == String.class) {
             return expectScalarValue(node, path);
@@ -243,82 +285,89 @@ public final class YamlMapper {
             return string.charAt(0);
         }
         if (rawClass == boolean.class || rawClass == Boolean.class) {
-            return parseBoolean(node, path);
+            return parseBoolean(expectScalarValue(node, path), path);
         }
         if (rawClass.isEnum()) {
             return readEnum(node, rawClass, path);
         }
-        if (Number.class.isAssignableFrom(rawClass) || rawClass.isPrimitive() && rawClass != boolean.class && rawClass != char.class) {
+        if (Number.class.isAssignableFrom(rawClass) || rawClass.isPrimitive()) {
             return readNumber(node, rawClass, path);
         }
-        if (Optional.class.isAssignableFrom(rawClass)) {
-            Type nestedType = ((ParameterizedType) type).getActualTypeArguments()[0];
+        if (rawClass == Optional.class) {
+            Type nestedType = type instanceof ParameterizedType parameterizedType
+                ? unwrapWildcard(parameterizedType.getActualTypeArguments()[0])
+                : Object.class;
             return Optional.ofNullable(readValueInternal(node, nestedType, path));
         }
+        ValueTypes.Codec codec = ValueTypes.forType(rawClass);
+        if (codec != null) {
+            return readValueType(node, codec, path);
+        }
         if (Map.class.isAssignableFrom(rawClass)) {
-            return readMap(node, type, path);
+            return readMap(node, type, rawClass, path);
         }
         if (Collection.class.isAssignableFrom(rawClass)) {
             return readCollection(node, type, rawClass, path);
         }
         if (rawClass.isArray()) {
-            return readArray(node, rawClass.componentType(), path);
+            Type componentType = type instanceof GenericArrayType genericArrayType
+                ? genericArrayType.getGenericComponentType()
+                : rawClass.componentType();
+            return readArray(node, componentType, path);
         }
 
-        return readBean(node, rawClass, path);
+        return readBean(node, type, rawClass, path);
     }
 
-    private Object readBean(YamlNode node, Class<?> rawClass, String path) {
+    private Object readBean(YamlNode node, Type type, Class<?> rawClass, String path) {
         YamlMapping mapping = expectMapping(node, path);
         BeanDescriptor descriptor = introspector.describe(rawClass);
-        if (descriptor.creator() == null) {
+        CreatorDescriptor creator = descriptor.creator();
+        if (creator == null) {
             throw new YamlMappingException("Type " + rawClass.getName() + " must declare no-args constructor or @YamlCreator constructor");
         }
-        if (descriptor.creator().parameters().isEmpty()) {
-            Object instance = descriptor.creator().invoker().apply(new Object[0]);
-            for (var entry : mapping.entries()) {
-                String key = scalarKey(entry.key(), path);
-                BeanProperty property = descriptor.properties().get(key);
-                if (property == null) {
-                    handleUnknownProperty(key, path);
-                    continue;
-                }
-                if (property.mutator() == null) {
-                    continue;
-                }
-                Object propertyValue = readValueInternal(entry.value(), property.type(), path + "." + property.yamlName());
-                property.mutator().set(instance, propertyValue);
-            }
-            return instance;
-        }
+        Map<TypeVariable<?>, Type> bindings = Types.typeBindings(type);
 
-        Object[] args = new Object[descriptor.creator().parameters().size()];
-        HashSet<String> creatorNames = new HashSet<>(descriptor.creator().parameters().size());
-        for (int i = 0; i < descriptor.creator().parameters().size(); i++) {
-            CreatorDescriptor.CreatorParameter parameter = descriptor.creator().parameters().get(i);
+        List<CreatorDescriptor.CreatorParameter> parameters = creator.parameters();
+        Object[] args = new Object[parameters.size()];
+        Set<String> creatorNames = new HashSet<>();
+        for (int i = 0; i < parameters.size(); i++) {
+            CreatorDescriptor.CreatorParameter parameter = parameters.get(i);
+            Type parameterType = Types.resolve(parameter.type(), bindings);
+            if (parameter.ignored()) {
+                args[i] = defaultValue(Types.rawClass(parameterType));
+                continue;
+            }
+            if (parameter.yamlName() == null) {
+                throw new YamlMappingException(
+                    "Cannot determine the name of parameter #" + i + " of the @YamlCreator constructor of " + rawClass.getName()
+                        + "; compile with -parameters or annotate the parameter with @YamlProperty"
+                );
+            }
             creatorNames.add(parameter.yamlName());
             YamlNode item = mapping.get(parameter.yamlName());
-            args[i] = readValueInternal(item == null ? YamlScalar.plain("null") : item, parameter.type(), path + "." + parameter.yamlName());
+            args[i] = readValueInternal(item == null ? nullScalar() : item, parameterType, path + "." + parameter.yamlName());
         }
-        if (config.failOnUnknownProperties()) {
-            for (var entry : mapping.entries()) {
-                String key = scalarKey(entry.key(), path);
-                boolean known = creatorNames.contains(key) || descriptor.properties().containsKey(key);
-                if (!known) {
-                    handleUnknownProperty(key, path);
-                }
+
+        List<YamlEntry> propertyEntries = new ArrayList<>();
+        for (YamlEntry entry : mapping.entries()) {
+            String key = scalarKey(entry.key(), path);
+            if (creatorNames.contains(key)) {
+                continue;
             }
+            BeanProperty property = descriptor.properties().get(key);
+            if (property == null || property.mutator() == null) {
+                handleUnknownProperty(key, path);
+                continue;
+            }
+            propertyEntries.add(entry);
         }
-        Object instance = descriptor.creator().invoker().apply(args);
-        if (!rawClass.isRecord()) {
-            for (var entry : mapping.entries()) {
-                String key = scalarKey(entry.key(), path);
-                BeanProperty property = descriptor.properties().get(key);
-                if (property != null && property.mutator() != null) {
-                    Object propertyValue = readValueInternal(entry.value(), property.type(), path + "." + property.yamlName());
-                    property.mutator().set(instance, propertyValue);
-                }
-            }
+
+        Object instance = creator.invoker().apply(args);
+        for (YamlEntry entry : propertyEntries) {
+            BeanProperty property = descriptor.properties().get(scalarKey(entry.key(), path));
+            Type propertyType = Types.resolve(property.type(), bindings);
+            property.mutator().set(instance, readValueInternal(entry.value(), propertyType, path + "." + property.yamlName()));
         }
         return instance;
     }
@@ -329,9 +378,55 @@ public final class YamlMapper {
         }
     }
 
-    private Object readArray(YamlNode node, Class<?> componentType, String path) {
+    private Object readUntyped(YamlNode node, String path) {
+        if (node instanceof YamlMapping) {
+            return readMap(node, Map.class, Map.class, path);
+        }
+        if (node instanceof YamlSequence) {
+            return readCollection(node, List.class, List.class, path);
+        }
+        YamlScalar scalar = (YamlScalar) node;
+        if (scalar.style() != YamlScalarStyle.PLAIN) {
+            return scalar.value();
+        }
+        return resolvePlainScalar(scalar.value(), path);
+    }
+
+    /**
+     * Resolves a plain scalar using the YAML 1.2 core schema; null values are handled by the caller.
+     */
+    private Object resolvePlainScalar(String value, String path) {
+        switch (value) {
+            case "true", "True", "TRUE" -> {
+                return Boolean.TRUE;
+            }
+            case "false", "False", "FALSE" -> {
+                return Boolean.FALSE;
+            }
+            default -> {
+            }
+        }
+        if (INTEGER.matcher(value).matches() || HEXADECIMAL.matcher(value).matches() || OCTAL.matcher(value).matches()) {
+            checkNumberLength(value, path);
+            BigInteger integer = parseDecimal(value, path).toBigIntegerExact();
+            if (integer.bitLength() < Integer.SIZE) {
+                return integer.intValue();
+            }
+            if (integer.bitLength() < Long.SIZE) {
+                return integer.longValue();
+            }
+            return integer;
+        }
+        if (INFINITY.matcher(value).matches() || NOT_A_NUMBER.matcher(value).matches() || DECIMAL.matcher(value).matches()) {
+            checkNumberLength(value, path);
+            return readDouble(value, path);
+        }
+        return value;
+    }
+
+    private Object readArray(YamlNode node, Type componentType, String path) {
         YamlSequence sequence = expectSequence(node, path);
-        Object result = Array.newInstance(componentType, sequence.size());
+        Object result = Array.newInstance(Types.rawClass(componentType), sequence.size());
         for (int i = 0; i < sequence.size(); i++) {
             Array.set(result, i, readValueInternal(sequence.get(i), componentType, path + "[" + i + "]"));
         }
@@ -351,18 +446,18 @@ public final class YamlMapper {
         return result;
     }
 
-    private Object readMap(YamlNode node, Type type, String path) {
+    private Object readMap(YamlNode node, Type type, Class<?> rawClass, String path) {
         YamlMapping mapping = expectMapping(node, path);
         Type mapValueType = Object.class;
         if (type instanceof ParameterizedType parameterizedType) {
-            Type keyType = unwrapWildcard(parameterizedType.getActualTypeArguments()[0]);
-            if (Types.rawClass(keyType) != String.class) {
+            Class<?> keyClass = Types.rawClass(unwrapWildcard(parameterizedType.getActualTypeArguments()[0]));
+            if (keyClass != String.class && keyClass != Object.class) {
                 throw new YamlMappingException("Current Java binding supports only Map<String, ?> at " + path);
             }
             mapValueType = unwrapWildcard(parameterizedType.getActualTypeArguments()[1]);
         }
-        Map<String, Object> result = new LinkedHashMap<>();
-        for (var entry : mapping.entries()) {
+        Map<String, Object> result = instantiateMap(rawClass);
+        for (YamlEntry entry : mapping.entries()) {
             String key = scalarKey(entry.key(), path);
             result.put(key, readValueInternal(entry.value(), mapValueType, path + "." + key));
         }
@@ -377,61 +472,217 @@ public final class YamlMapper {
                 return enumValue;
             }
         }
-        throw new YamlMappingException("Unknown enum constant '" + name + "' for " + rawClass.getName() + " at " + path);
+        throw new YamlMappingException("Unknown enum constant '" + abbreviate(name) + "' for " + rawClass.getName() + " at " + path);
+    }
+
+    private Object readValueType(YamlNode node, ValueTypes.Codec codec, String path) {
+        String lexical = expectScalarValue(node, path);
+        try {
+            return codec.parser().apply(lexical);
+        } catch (RuntimeException exception) {
+            throw new YamlMappingException(
+                "Invalid " + codec.type().getSimpleName() + " value at " + path + ": " + abbreviate(lexical),
+                exception
+            );
+        }
     }
 
     private Object readNumber(YamlNode node, Class<?> rawClass, String path) {
         String lexical = expectScalarValue(node, path);
+        checkNumberLength(lexical, path);
+        Class<?> type = MethodType.methodType(rawClass).wrap().returnType();
         try {
-            if (rawClass == byte.class || rawClass == Byte.class) {
-                return new BigDecimal(lexical).byteValueExact();
+            if (type == Double.class) {
+                return readDouble(lexical, path);
             }
-            if (rawClass == short.class || rawClass == Short.class) {
-                return new BigDecimal(lexical).shortValueExact();
+            if (type == Float.class) {
+                return readFloat(lexical, path);
             }
-            if (rawClass == int.class || rawClass == Integer.class) {
-                return new BigDecimal(lexical).intValueExact();
+            if (type == Number.class && (INFINITY.matcher(lexical).matches() || NOT_A_NUMBER.matcher(lexical).matches())) {
+                return readDouble(lexical, path);
             }
-            if (rawClass == long.class || rawClass == Long.class) {
-                return new BigDecimal(lexical).longValueExact();
+            if (type == Byte.class) {
+                return parseDecimal(lexical, path).byteValueExact();
             }
-            if (rawClass == float.class || rawClass == Float.class) {
-                return new BigDecimal(lexical).floatValue();
+            if (type == Short.class) {
+                return parseDecimal(lexical, path).shortValueExact();
             }
-            if (rawClass == double.class || rawClass == Double.class) {
-                return new BigDecimal(lexical).doubleValue();
+            if (type == Integer.class) {
+                return parseDecimal(lexical, path).intValueExact();
             }
-            if (rawClass == BigInteger.class) {
-                return new BigDecimal(lexical).toBigIntegerExact();
+            if (type == Long.class) {
+                return parseDecimal(lexical, path).longValueExact();
             }
-            if (rawClass == BigDecimal.class) {
-                return new BigDecimal(lexical);
+            if (type == BigInteger.class) {
+                return checkMagnitude(parseDecimal(lexical, path), lexical, path).toBigIntegerExact();
+            }
+            if (type == BigDecimal.class || type == Number.class) {
+                return checkMagnitude(parseDecimal(lexical, path), lexical, path);
             }
         } catch (ArithmeticException exception) {
-            throw new YamlMappingException("Number out of range at " + path + ": " + lexical, exception);
-        }
-        if (rawClass == Number.class) {
-            return new BigDecimal(lexical);
+            throw new YamlMappingException("Number out of range at " + path + ": " + abbreviate(lexical), exception);
         }
         throw new YamlMappingException("Unsupported numeric type " + rawClass.getName() + " at " + path);
     }
 
-    private Collection<Object> instantiateCollection(Class<?> rawClass) {
-        if (rawClass.isInterface()) {
-            if (List.class.isAssignableFrom(rawClass) || Collection.class == rawClass) {
-                return new ArrayList<>();
+    private double readDouble(String lexical, String path) {
+        if (INFINITY.matcher(lexical).matches()) {
+            return lexical.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+        }
+        if (NOT_A_NUMBER.matcher(lexical).matches()) {
+            return Double.NaN;
+        }
+        double value = DECIMAL.matcher(lexical).matches()
+            ? Double.parseDouble(lexical)
+            : parseDecimal(lexical, path).doubleValue();
+        if (Double.isInfinite(value)) {
+            throw new YamlMappingException("Number out of range at " + path + ": " + abbreviate(lexical));
+        }
+        return value;
+    }
+
+    private float readFloat(String lexical, String path) {
+        if (INFINITY.matcher(lexical).matches()) {
+            return lexical.startsWith("-") ? Float.NEGATIVE_INFINITY : Float.POSITIVE_INFINITY;
+        }
+        if (NOT_A_NUMBER.matcher(lexical).matches()) {
+            return Float.NaN;
+        }
+        float value = DECIMAL.matcher(lexical).matches()
+            ? Float.parseFloat(lexical)
+            : parseDecimal(lexical, path).floatValue();
+        if (Float.isInfinite(value)) {
+            throw new YamlMappingException("Number out of range at " + path + ": " + abbreviate(lexical));
+        }
+        return value;
+    }
+
+    private static BigDecimal parseDecimal(String lexical, String path) {
+        try {
+            if (HEXADECIMAL.matcher(lexical).matches()) {
+                return new BigDecimal(new BigInteger(lexical.substring(2), 16));
             }
-            if (java.util.Set.class.isAssignableFrom(rawClass)) {
-                return new LinkedHashSet<>();
+            if (OCTAL.matcher(lexical).matches()) {
+                return new BigDecimal(new BigInteger(lexical.substring(2), 8));
             }
-            throw new YamlMappingException("Unsupported collection type " + rawClass.getName());
+            if (DECIMAL.matcher(lexical).matches()) {
+                return new BigDecimal(lexical);
+            }
+        } catch (NumberFormatException exception) {
+            throw new YamlMappingException("Invalid number at " + path + ": " + abbreviate(lexical), exception);
+        }
+        throw new YamlMappingException("Invalid number at " + path + ": " + abbreviate(lexical));
+    }
+
+    private void checkNumberLength(String lexical, String path) {
+        if (lexical.length() > config.processingLimits().maxNumberLength()) {
+            throw new YamlMappingException("Number length exceeds configured limit at " + path);
+        }
+    }
+
+    /**
+     * Rejects values such as {@code 1e999999999} whose expansion would be disproportionately expensive.
+     */
+    private BigDecimal checkMagnitude(BigDecimal decimal, String lexical, String path) {
+        long integerDigits = (long) decimal.precision() - decimal.scale();
+        if (decimal.signum() != 0 && Math.abs(integerDigits) > config.processingLimits().maxNumberLength()) {
+            throw new YamlMappingException("Number magnitude exceeds configured limit at " + path + ": " + abbreviate(lexical));
+        }
+        return decimal;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> instantiateMap(Class<?> rawClass) {
+        if (rawClass.isAssignableFrom(LinkedHashMap.class)) {
+            return new LinkedHashMap<>();
+        }
+        if (rawClass.isAssignableFrom(TreeMap.class)) {
+            return new TreeMap<>();
+        }
+        return (Map<String, Object>) instantiate(rawClass, "map");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Collection<Object> instantiateCollection(Class<?> rawClass) {
+        if (rawClass.isAssignableFrom(ArrayList.class)) {
+            return new ArrayList<>();
+        }
+        if (rawClass.isAssignableFrom(LinkedHashSet.class)) {
+            return new LinkedHashSet<>();
+        }
+        if (rawClass.isAssignableFrom(TreeSet.class)) {
+            return new TreeSet<>();
+        }
+        if (rawClass.isAssignableFrom(ArrayDeque.class)) {
+            return new ArrayDeque<>();
+        }
+        return (Collection<Object>) instantiate(rawClass, "collection");
+    }
+
+    private static Object instantiate(Class<?> rawClass, String kind) {
+        if (rawClass.isInterface() || Modifier.isAbstract(rawClass.getModifiers())) {
+            throw new YamlMappingException("Unsupported " + kind + " type " + rawClass.getName());
         }
         try {
-            @SuppressWarnings("unchecked")
-            Collection<Object> collection = (Collection<Object>) rawClass.getDeclaredConstructor().newInstance();
-            return collection;
-        } catch (ReflectiveOperationException exception) {
-            throw new YamlMappingException("Cannot instantiate collection type " + rawClass.getName(), exception);
+            return rawClass.getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            throw new YamlMappingException("Cannot instantiate " + kind + " type " + rawClass.getName(), exception);
+        }
+    }
+
+    private static Object defaultValue(Class<?> type) {
+        if (type.isPrimitive()) {
+            return Array.get(Array.newInstance(type, 1), 0);
+        }
+        return type == Optional.class ? Optional.empty() : null;
+    }
+
+    private TypeAdapter<Object> findReadAdapter(Type type) {
+        if (adapters.isEmpty()) {
+            return null;
+        }
+        TypeAdapter<?> adapter = adapters.get(type);
+        if (adapter == null && !(type instanceof Class<?>)) {
+            adapter = adapters.get(Types.rawClass(type));
+        }
+        return cast(adapter);
+    }
+
+    private TypeAdapter<Object> findWriteAdapter(Class<?> type) {
+        if (adapters.isEmpty()) {
+            return null;
+        }
+        ArrayDeque<Class<?>> interfaces = new ArrayDeque<>();
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            TypeAdapter<?> adapter = adapters.get(current);
+            if (adapter != null) {
+                return cast(adapter);
+            }
+            interfaces.addAll(Arrays.asList(current.getInterfaces()));
+        }
+        Set<Class<?>> visited = new HashSet<>();
+        while (!interfaces.isEmpty()) {
+            Class<?> candidate = interfaces.poll();
+            if (!visited.add(candidate)) {
+                continue;
+            }
+            TypeAdapter<?> adapter = adapters.get(candidate);
+            if (adapter != null) {
+                return cast(adapter);
+            }
+            interfaces.addAll(Arrays.asList(candidate.getInterfaces()));
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static TypeAdapter<Object> cast(TypeAdapter<?> adapter) {
+        return (TypeAdapter<Object>) adapter;
+    }
+
+    private static void enter(Object value, IdentityHashMap<Object, Boolean> activeObjects) {
+        if (activeObjects.put(value, Boolean.TRUE) != null) {
+            throw new YamlMappingException("Cyclic object graph detected while serializing " + value.getClass().getName());
         }
     }
 
@@ -459,24 +710,28 @@ public final class YamlMapper {
         return scalar.value();
     }
 
-    private boolean parseBoolean(YamlNode node, String path) {
-        String lexical = expectScalarValue(node, path);
+    private boolean parseBoolean(String lexical, String path) {
         return switch (lexical) {
             case "true", "True", "TRUE" -> true;
             case "false", "False", "FALSE" -> false;
-            default -> throw new YamlMappingException("Expected YAML 1.2 boolean at " + path + ", got: " + lexical);
+            default -> throw new YamlMappingException("Expected YAML 1.2 boolean at " + path + ", got: " + abbreviate(lexical));
         };
     }
 
-    private boolean isNullNode(YamlNode node) {
+    /**
+     * Only plain scalars can be null; quoted {@code "null"} and {@code "~"} are strings.
+     */
+    private static boolean isNullNode(YamlNode node) {
         if (!(node instanceof YamlScalar scalar)) {
             return false;
         }
-        return scalar.value() == null
-            || scalar.value().equals("null")
-            || scalar.value().equals("Null")
-            || scalar.value().equals("NULL")
-            || scalar.value().equals("~");
+        if (scalar.value() == null) {
+            return true;
+        }
+        return scalar.style() == YamlScalarStyle.PLAIN && switch (scalar.value()) {
+            case "null", "Null", "NULL", "~" -> true;
+            default -> false;
+        };
     }
 
     private String scalarKey(YamlNode key, String path) {
@@ -486,10 +741,22 @@ public final class YamlMapper {
         return scalar.value();
     }
 
-    private Type unwrapWildcard(Type type) {
+    private static Type unwrapWildcard(Type type) {
         if (type instanceof WildcardType wildcardType) {
             return wildcardType.getUpperBounds()[0];
         }
         return type;
+    }
+
+    private static YamlScalar nullScalar() {
+        return YamlScalar.plain("null");
+    }
+
+    private static YamlScalar quoted(String value) {
+        return new YamlScalar(value, null, null, YamlScalarStyle.DOUBLE_QUOTED);
+    }
+
+    private static String abbreviate(String value) {
+        return value.length() <= 40 ? value : value.substring(0, 40) + "...";
     }
 }

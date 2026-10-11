@@ -10,7 +10,7 @@ public final class ColdStart {
     }
 
     public static void main(String[] args) {
-        YamlLib lib = YamlLib.of(args[0], false);
+        YamlLib lib = YamlLib.of(args[0], YamlLib.Mode.DEFAULTS);
         Object value = lib.parseUntyped(Data.smallConfig());
         long elapsed = System.currentTimeMillis() - ManagementFactory.getRuntimeMXBean().getStartTime();
         System.out.println("COLD|" + elapsed + "|" + value.getClass().getSimpleName());

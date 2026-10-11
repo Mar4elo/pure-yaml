@@ -84,32 +84,34 @@ register a `TypeAdapter` for them.
 
 ## Performance
 
-Compared with SnakeYAML 2.7 and Jackson 2.22.3 (`jackson-dataformat-yaml`) on the same inputs, single
-thread, JDK 21 (lower is better):
+Compared with SnakeYAML 2.7, snakeyaml-engine 3.2 and Jackson 2.22.3 (`jackson-dataformat-yaml`) on
+the same inputs, single thread, JDK 21, JMH with 3 forks (lower is better):
 
-| Operation | io.pure:yaml | SnakeYAML | Jackson |
-| --- | --- | --- | --- |
-| Parse 10 MB to a YAML tree | **60 ms** | 294 ms | 233 ms |
-| Read 10 MB into maps and lists | **87 ms** | 545 ms | 233 ms |
-| Bind 10 MB to POJOs | **98 ms** | 578 ms | 229 ms |
-| Write 50 000 objects | **52 ms** | 884 ms | 118 ms |
-| Read 1.8 MB of single-line JSON | **17 ms** | 76 ms | 41 ms |
-| Resolve 10 000 aliases | **4.4 ms** | 18 ms | 6.6 ms (aliases not resolved) |
-| Memory allocated reading 10 MB into maps | **369 MB** | 1 367 MB | 811 MB |
-| JVM start to first parsed document | **19 ms** | 32 ms | 84 ms |
-| Runtime footprint | **117 KB, 1 jar** | 324 KB, 1 jar | 2.7 MB, 5 jars |
+| Operation | io.pure:yaml | SnakeYAML | snakeyaml-engine | Jackson |
+| --- | --- | --- | --- | --- |
+| Parse the GitHub OpenAPI description (9.4 MB) to a tree | **50 ms** | 132 ms | 141 ms | 110 ms |
+| Read it into maps and lists | **68 ms** | 227 ms | 272 ms | 106 ms |
+| Read cert-manager CRDs (1 MB, 47 documents) into maps | **4.2 ms** | 9.1 ms | 10.2 ms | 5.8 ms |
+| Read 10 MB of block-style records into maps | **94 ms** | 537 ms | 612 ms | 225 ms |
+| Bind 10 MB to POJOs | **104 ms** | 571 ms | – | 231 ms |
+| Write 50 000 objects | **51 ms** | 852 ms | – | 118 ms |
+| Memory allocated reading the OpenAPI description into maps | **190 MB** | 575 MB | 692 MB | 367 MB |
+| JVM start to first parsed document | **20 ms** | 34 ms | 30 ms | 90 ms |
+| Runtime footprint | **117 KB, 1 jar** | 324 KB, 1 jar | 302 KB, 1 jar | 2.7 MB, 5 jars |
 
-Every benchmark of the suite is faster than both libraries. Allocation is 1.4–11× lower in all of
-them except block scalars, where all three libraries allocate about the same (the text itself). Edge
-cases run with each library's defaults: io.pure:yaml also rejects inputs that the others accept
-silently with a wrong result (duplicate keys, `1e1000000000` read as `Infinity`, aliases left
-unresolved by Jackson), and it rejects an oversized 10 MB scalar in 9 ms where the others take more
-than 4 s.
+On six real documents (OpenAPI, Kubernetes manifests, Helm values, a Faker locale in Cyrillic,
+docker-compose) io.pure:yaml parses 2.0–4.2× faster than SnakeYAML, 2.3–4.7× faster than
+snakeyaml-engine and 1.4–3.3× faster than Jackson; the lead over Jackson is smallest on large
+multi-document manifests. Every benchmark of the suite is faster than all three libraries, and
+allocation is lower in all of them except block scalars, where all four allocate about the same (the
+text itself). Edge cases run with each library's defaults: io.pure:yaml also rejects inputs that
+others accept silently with a wrong result (duplicate keys, `1e1000000000` read as `Infinity`,
+aliases left unresolved by Jackson).
 
-All measurements, allocation figures, edge cases and the test environment are in
+All measurements, allocation figures, edge cases, the inputs and the test environment are in
 [BENCHMARKS.md](BENCHMARKS.md); the benchmark code and the instructions to reproduce them are in
-[benchmarks/](benchmarks/README.md). Results depend on the hardware and JVM, so measure on your own
-workload before relying on them.
+[benchmarks/](benchmarks/README.md). Results depend on the hardware, the JVM and the shape of the
+documents, so measure on your own workload before relying on them.
 
 ## What Is Supported Today
 
@@ -704,8 +706,8 @@ Binding annotations:
 - `@YamlValue`
 - `@YamlInclude`
 
-The separate [benchmarks](benchmarks/README.md) module compares the library with SnakeYAML and Jackson;
-it is not part of the library build.
+The separate [benchmarks](benchmarks/README.md) module compares the library with SnakeYAML,
+snakeyaml-engine and Jackson; it is not part of the library build.
 
 ## Error Handling
 

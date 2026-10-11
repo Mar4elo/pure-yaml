@@ -10,11 +10,13 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Runs every edge case with every library in a separate JVM with a memory and time limit, and
- * prints a Markdown table. Also measures cold start: the wall time from JVM start until a small
- * configuration has been parsed.
+ * prints a Markdown table. Also measures cold start (the wall time from JVM start until a small
+ * configuration has been parsed) with the default JIT and with C1 only, and the size of the
+ * written output.
  */
 public final class EdgeRunner {
-    private static final List<String> LIBS = List.of("pure", "snakeyaml", "jackson");
+    private static final List<String> LIBS = YamlLib.NAMES;
+    private static final List<String> WRITERS = List.of("pure", "snakeyaml", "jackson");
     private static final int TIMEOUT_SECONDS = 30;
     private static final int COLD_START_RUNS = 7;
 
@@ -33,17 +35,33 @@ public final class EdgeRunner {
             System.out.println("| " + caseName + " | " + String.join(" | ", cells) + " |");
         }
 
-        System.out.println("\n## Cold start (JVM start to first parsed document, median of " + COLD_START_RUNS + " runs)\n");
-        System.out.println("| Library | ms |");
-        System.out.println("|---|---|");
+        System.out.println("\n## Cold start (JVM start to first parsed document, median of " + COLD_START_RUNS + " runs, ms)\n");
+        System.out.println("| Library | default JIT | -XX:TieredStopAtLevel=1 |");
+        System.out.println("|---|---|---|");
         for (String lib : LIBS) {
-            List<Long> times = new ArrayList<>();
-            for (int i = 0; i < COLD_START_RUNS; i++) {
-                times.add(coldStart(lib));
-            }
-            times.sort(null);
-            System.out.println("| " + lib + " | " + times.get(times.size() / 2) + " |");
+            System.out.println("| " + lib + " | " + coldStartMedian(lib, List.of()) + " | "
+                + coldStartMedian(lib, List.of("-XX:TieredStopAtLevel=1")) + " |");
         }
+
+        System.out.println("\n## Written output (default settings)\n");
+        System.out.println("| Library | 500 records, bytes | 500 records, lines | 50 000 records, bytes |");
+        System.out.println("|---|---|---|---|");
+        for (String lib : WRITERS) {
+            YamlLib writer = YamlLib.of(lib, YamlLib.Mode.DEFAULTS);
+            String medium = writer.write(Data.recordObjects(500));
+            String large = writer.write(Data.recordObjects(50_000));
+            System.out.println("| " + lib + " | " + medium.getBytes(StandardCharsets.UTF_8).length + " | "
+                + medium.lines().count() + " | " + large.getBytes(StandardCharsets.UTF_8).length + " |");
+        }
+    }
+
+    private static long coldStartMedian(String lib, List<String> jvmArgs) throws Exception {
+        List<Long> times = new ArrayList<>();
+        for (int i = 0; i < COLD_START_RUNS; i++) {
+            times.add(coldStart(lib, jvmArgs));
+        }
+        times.sort(null);
+        return times.get(times.size() / 2);
     }
 
     private static String runCase(String lib, String caseName) throws Exception {
@@ -60,8 +78,10 @@ public final class EdgeRunner {
         return parts[1] + ", " + parts[2] + " ms: " + escape(parts[3]);
     }
 
-    private static long coldStart(String lib) throws Exception {
-        Result result = run(List.of("-Xshare:auto", "-XX:TieredStopAtLevel=1", "-cp", classpath(), ColdStart.class.getName(), lib));
+    private static long coldStart(String lib, List<String> jvmArgs) throws Exception {
+        List<String> args = new ArrayList<>(jvmArgs);
+        args.addAll(List.of("-Xshare:auto", "-cp", classpath(), ColdStart.class.getName(), lib));
+        Result result = run(args);
         String line = result.output().lines().filter(l -> l.startsWith("COLD|")).findFirst()
             .orElseThrow(() -> new IllegalStateException("No cold start result for " + lib + ":\n" + result.output()));
         return Long.parseLong(line.split("\\|")[1]);

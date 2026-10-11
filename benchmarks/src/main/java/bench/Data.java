@@ -1,5 +1,10 @@
 package bench;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -11,7 +16,22 @@ import bench.model.Records;
  * Deterministic inputs; every library reads exactly the same text.
  */
 public final class Data {
+    /** Real-world documents downloaded by fetch-data.sh, see benchmarks/README.md. */
+    public static final List<String> REAL_DOCUMENTS = List.of(
+        "openapi-github.yaml", "cert-manager.yaml", "helm-values.yaml", "faker-ru.yml", "ingress-nginx.yaml", "compose.yaml"
+    );
+
     private Data() {
+    }
+
+    /** Reads a real-world document from the data directory (system property bench.data, default "data"). */
+    public static String real(String name) {
+        Path path = Path.of(System.getProperty("bench.data", "data"), name);
+        try {
+            return Files.readString(path, StandardCharsets.UTF_8);
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Run fetch-data.sh first: cannot read " + path.toAbsolutePath(), exception);
+        }
     }
 
     /** A typical application configuration, about 1.5 KB. */

@@ -4,6 +4,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
+import org.snakeyaml.engine.v2.api.Load;
+import org.snakeyaml.engine.v2.api.LoadSettings;
 import org.yaml.snakeyaml.Yaml;
 
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
@@ -11,8 +13,10 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
 import io.pure.yaml.binding.mapper.YamlMapper;
 
 /**
- * Runs one edge case with one library, using the library's default settings, and prints
- * {@code RESULT|outcome|milliseconds|detail}. Meant to be run in its own JVM (see {@link EdgeRunner}).
+ * Runs one edge case with one library, using the library's default settings (except for
+ * {@code aliases_10000_enabled}), and prints {@code RESULT|outcome|milliseconds|detail}, where the
+ * outcome is {@code accepted}, {@code rejected} (an exception) or {@code crashed} (an error such as
+ * StackOverflowError or OutOfMemoryError). Meant to be run in its own JVM (see {@link EdgeRunner}).
  */
 public final class EdgeCases {
     public static final List<String> CASES = List.of(
@@ -27,6 +31,7 @@ public final class EdgeCases {
         "unknown_tag_object",
         "utf16_bytes",
         "aliases_10000",
+        "aliases_10000_enabled",
         "invalid_tab_indent",
         "empty_document"
     );
@@ -35,17 +40,20 @@ public final class EdgeCases {
     }
 
     public static void main(String[] args) {
-        YamlLib lib = YamlLib.of(args[0], false);
         String caseName = args[1];
+        YamlLib lib = YamlLib.of(args[0], caseName.equals("aliases_10000_enabled") ? YamlLib.Mode.ALIASES_ENABLED : YamlLib.Mode.DEFAULTS);
         String outcome;
         String detail;
         long start = System.nanoTime();
         try {
             detail = run(lib, caseName);
-            outcome = detail.startsWith("REJECTED") ? "rejected" : "accepted";
-        } catch (Throwable error) {
-            outcome = "error";
-            detail = error.getClass().getSimpleName() + ": " + abbreviate(String.valueOf(error.getMessage()));
+            outcome = "accepted";
+        } catch (Exception exception) {
+            outcome = "rejected";
+            detail = exception.getClass().getSimpleName() + ": " + abbreviate(String.valueOf(exception.getMessage()));
+        } catch (Error error) {
+            outcome = "crashed";
+            detail = error.getClass().getSimpleName();
         }
         long millis = (System.nanoTime() - start) / 1_000_000;
         System.out.println("RESULT|" + outcome + "|" + millis + "|" + detail);
@@ -64,7 +72,7 @@ public final class EdgeCases {
             case "duplicate_keys" -> describe(lib.parseUntyped("a: 1\nb: 2\na: 3\n"));
             case "unknown_tag_object" -> describe(lib.parseUntyped("!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [[!!java.net.URL [\"http://127.0.0.1:1/\"]]]]"));
             case "utf16_bytes" -> utf16(lib);
-            case "aliases_10000" -> describe(lib.parseUntyped(Data.anchors(10_000)));
+            case "aliases_10000", "aliases_10000_enabled" -> describe(lib.parseUntyped(Data.anchors(10_000)));
             case "invalid_tab_indent" -> describe(lib.parseUntyped("a:\n\tb: 1\n"));
             case "empty_document" -> describe(lib.parseUntyped(""));
             default -> throw new IllegalArgumentException(caseName);
@@ -76,6 +84,7 @@ public final class EdgeCases {
         Object value = switch (lib.name()) {
             case "pure" -> YamlMapper.createDefault().readValue(bytes, Object.class);
             case "snakeyaml" -> new Yaml().load(new java.io.ByteArrayInputStream(bytes));
+            case "engine" -> new Load(LoadSettings.builder().build()).loadFromInputStream(new java.io.ByteArrayInputStream(bytes));
             default -> {
                 try {
                     yield new YAMLMapper().readValue(bytes, Object.class);

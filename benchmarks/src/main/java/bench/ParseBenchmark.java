@@ -14,21 +14,19 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Warmup;
 
-import bench.model.Records;
-
 /**
- * Throughput of the common operations. Inputs: a 1 KB configuration, 500 records (100 KB) and
- * 50 000 records (10.8 MB) in block style, 10 000 records as single-line JSON (1.9 MB), 10 000
- * aliases (450 KB), 2 000 block scalars (1.5 MB) and a stream of 1 000 documents (45 KB).
+ * Parsing synthetic inputs: a 1 KB configuration, 500 records (100 KB) and 50 000 records (10.8 MB)
+ * in block style, 10 000 records as single-line JSON (1.9 MB), 10 000 aliases (450 KB), 2 000 block
+ * scalars (1.5 MB) and a stream of 1 000 documents (45 KB).
  */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Thread)
-@Fork(1)
-@Warmup(iterations = 3, time = 1)
-@Measurement(iterations = 5, time = 1)
-public class YamlBenchmark {
-    @Param({"pure", "snakeyaml", "jackson"})
+@Fork(value = 3, jvmArgsAppend = {"-Xms4g", "-Xmx4g", "-XX:+AlwaysPreTouch"})
+@Warmup(iterations = 5, time = 2)
+@Measurement(iterations = 5, time = 2)
+public class ParseBenchmark {
+    @Param({"pure", "snakeyaml", "engine", "jackson"})
     public String lib;
 
     private YamlLib yaml;
@@ -39,12 +37,10 @@ public class YamlBenchmark {
     private String anchors;
     private String blocks;
     private String stream;
-    private Records mediumObjects;
-    private Records largeObjects;
 
     @Setup
     public void setup() {
-        yaml = YamlLib.of(lib, true);
+        yaml = YamlLib.of(lib, YamlLib.Mode.BENCHMARK);
         small = Data.smallConfig();
         medium = Data.records(500);
         large = Data.records(50_000);
@@ -52,8 +48,6 @@ public class YamlBenchmark {
         anchors = Data.anchors(10_000);
         blocks = Data.blockScalars(2_000);
         stream = Data.multiDocument(1_000);
-        mediumObjects = Data.recordObjects(500);
-        largeObjects = Data.recordObjects(50_000);
     }
 
     @Benchmark
@@ -67,6 +61,8 @@ public class YamlBenchmark {
     }
 
     @Benchmark
+    @Warmup(iterations = 5, time = 3)
+    @Measurement(iterations = 5, time = 5)
     public Object tree_large() {
         return yaml.parseTree(large);
     }
@@ -82,28 +78,10 @@ public class YamlBenchmark {
     }
 
     @Benchmark
+    @Warmup(iterations = 5, time = 3)
+    @Measurement(iterations = 5, time = 5)
     public Object untyped_large() {
         return yaml.parseUntyped(large);
-    }
-
-    @Benchmark
-    public Object bind_medium() {
-        return yaml.bindRecords(medium);
-    }
-
-    @Benchmark
-    public Object bind_large() {
-        return yaml.bindRecords(large);
-    }
-
-    @Benchmark
-    public Object write_medium() {
-        return yaml.write(mediumObjects);
-    }
-
-    @Benchmark
-    public Object write_large() {
-        return yaml.write(largeObjects);
     }
 
     @Benchmark
@@ -123,6 +101,6 @@ public class YamlBenchmark {
 
     @Benchmark
     public int stream_1000() {
-        return yaml.parseStream(stream);
+        return yaml.parseUntypedAll(stream);
     }
 }

@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Commit of the "data" branch of https://github.com/yaml/yaml-test-suite used by YamlTestSuiteTest.
+  YAML_TEST_SUITE_COMMIT: 6ad3d2c62885d82fc349026c136ef560838fdf3d
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,4 +19,9 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
+      - name: Fetch yaml-test-suite
+        run: |
+          git clone --quiet --branch data https://github.com/yaml/yaml-test-suite.git "$RUNNER_TEMP/yaml-test-suite"
+          git -C "$RUNNER_TEMP/yaml-test-suite" checkout --quiet "$YAML_TEST_SUITE_COMMIT"
+          echo "YAML_TEST_SUITE_DIR=$RUNNER_TEMP/yaml-test-suite" >> "$GITHUB_ENV"
       - run: mvn -B verify

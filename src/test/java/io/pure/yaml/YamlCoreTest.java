@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -251,6 +253,97 @@ class YamlCoreTest {
     }
 
     @Test
+    void foldsMultiLinePlainScalars() {
+        YamlMapping mapping = (YamlMapping) Yaml.parse("""
+            plain: first
+              second
+
+              third # comment
+            block:
+              This unquoted scalar
+              spans many lines.
+            next: x
+            """);
+        assertEquals("first second\nthird", scalar(mapping.get("plain")));
+        assertEquals("This unquoted scalar spans many lines.", scalar(mapping.get("block")));
+        assertEquals("x", scalar(mapping.get("next")));
+
+        YamlSequence sequence = (YamlSequence) Yaml.parse("- single multiline\n - sequence entry\n- b");
+        assertEquals("single multiline - sequence entry", scalar(sequence.get(0)));
+        assertEquals("b", scalar(sequence.get(1)));
+        assertEquals("1st non-empty\n2nd non-empty 3rd non-empty", scalar(Yaml.parse("1st non-empty\n\n 2nd non-empty \n\t3rd non-empty")));
+    }
+
+    @Test
+    void foldsMultiLineQuotedScalars() {
+        assertEquals(" 1st non-empty\n2nd non-empty 3rd non-empty ",
+            scalar(Yaml.parse("\" 1st non-empty\n\n 2nd non-empty \n\t3rd non-empty \"")));
+        assertEquals(" 1st non-empty\n2nd non-empty 3rd non-empty ",
+            scalar(Yaml.parse("' 1st non-empty\n\n 2nd non-empty \n\t3rd non-empty '")));
+        assertEquals("folded to a space,\nto a line feed, or \t \tnon-content",
+            scalar(Yaml.parse("\"folded \nto a space,\t\n \nto a line feed, or \t\\\n \\ \tnon-content\"")));
+
+        YamlMapping mapping = (YamlMapping) Yaml.parse("""
+            quoted: "So does this
+              quoted scalar.\\n"
+            single: 'it''s
+              folded'
+            empty: '
+
+              '
+            """);
+        assertEquals("So does this quoted scalar.\n", scalar(mapping.get("quoted")));
+        assertEquals("it's folded", scalar(mapping.get("single")));
+        // An escaped space before a line break is content; an escaped line break joins the lines.
+        assertEquals("a  b", scalar(Yaml.parse("\"a\\ \n  b\"")));
+        assertEquals("ab", scalar(Yaml.parse("\"a\\\n  b\"")));
+        assertEquals("\n", scalar(mapping.get("empty")));
+        assertEquals("a ...x b", scalar(Yaml.parse("--- \"a\n...x\nb\"")));
+    }
+
+    @Test
+    void allowsTabsAsSeparatorsButNotAsIndentation() {
+        assertEquals("bar", scalar(((YamlMapping) Yaml.parse("foo:\n \tbar")).get("foo")));
+        assertEquals("bar baz", scalar(((YamlMapping) Yaml.parse("foo: \"bar\n  \tbaz\"")).get("foo")));
+        assertEquals("x x", scalar(((YamlSequence) ((YamlMapping) Yaml.parse("x:\n - x\n  \tx")).get("x")).get(0)));
+        assertEquals("-1", scalar(((YamlSequence) Yaml.parse("-\t-1")).get(0)));
+        assertEquals("b", scalar(((YamlMapping) Yaml.parse("a:\tb")).get("a")));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("foo: \"bar\n\tbaz\""));
+    }
+
+    @Test
+    void readsContentOnDocumentStartLine() {
+        YamlStream stream = Yaml.parseStream("--- foo  # comment\n---\tbar\n--- 'multi\n  line'", new YamlProcessingLimits(8, 8, 3, 100));
+        assertEquals(List.of("foo", "bar", "multi line"), stream.documents().stream().map(document -> scalar(document.root())).toList());
+    }
+
+    @Test
+    void treatsStreamsWithoutContentAsHavingNoDocuments() {
+        YamlProcessingLimits limits = new YamlProcessingLimits(8, 8, 2, 100);
+        assertEquals(0, Yaml.parseStream("", limits).documents().size());
+        assertEquals(0, Yaml.parseStream("# only a comment\n", limits).documents().size());
+        assertEquals(0, Yaml.parseStream("...\n# comment\n...\n", limits).documents().size());
+        assertEquals(1, Yaml.parseStream("---\n", limits).documents().size());
+        assertNull(scalar(Yaml.parse("...\n")));
+    }
+
+    @Test
+    void allowsByteOrderMarkOnlyAtDocumentStart() {
+        YamlProcessingLimits limits = new YamlProcessingLimits(8, 8, 2, 100);
+        assertEquals(2, Yaml.parseStream("\uFEFFa: 1\n...\n\uFEFF# prefix\n---\nb: 2", limits).documents().size());
+        YamlParseException exception = assertThrows(YamlParseException.class, () -> Yaml.parse("a: 1\n\uFEFF# comment\n"));
+        assertTrue(exception.getMessage().contains("Byte order mark"));
+    }
+
+    @Test
+    void rejectsNonPrintableCharacters() {
+        YamlParseException exception = assertThrows(YamlParseException.class, () -> Yaml.parse("a: \"x\u0007\""));
+        assertTrue(exception.getMessage().contains("Non-printable character U+0007 at line 1"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("a: \uD800"));
+        assertEquals("\u0085 \uD83D\uDE00", scalar(((YamlMapping) Yaml.parse("a: \u0085 \uD83D\uDE00")).get("a")));
+    }
+
+    @Test
     void readsEmptyDocumentAsNull() {
         assertNull(scalar(Yaml.parse("")));
         assertNull(scalar(Yaml.parse("# only a comment\n---\n")));
@@ -289,8 +382,17 @@ class YamlCoreTest {
         "%TAG ! tag:example.com,2000:\n---\na: 1",
         "%YAML 2.0\n---\na: 1",
         "%YAML 1.2\na: 1",
-        "--- inline\n",
-        "a: 'multi\n  line'",
+        "--- a: b\n",
+        "--- - a\n",
+        "a: 'multi\nline'",
+        "a: \"x\n...\ny\"",
+        "a: b\n  c: d",
+        "-\t- a",
+        "- \t- a",
+        "foo:\n  a: 1\n  \tb: 2",
+        "a: 1\n\uFEFFb: 2",
+        "a: x\u0001y",
+        "a: \u007F",
         "*alias: value",
         "a: @reserved",
     })

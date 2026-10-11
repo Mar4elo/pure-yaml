@@ -34,10 +34,17 @@ public final class YamlParser {
         this.limits = limits;
     }
 
+    /**
+     * Parses a stream that contains at most one document; a stream without documents
+     * (empty, or only comments) yields a document whose root is an empty node.
+     */
     public YamlDocument parse() {
         reset();
+        if (!skipToDocument()) {
+            return new YamlDocument(emptyNode());
+        }
         YamlDocument document = parseDocument();
-        if (!atEnd()) {
+        if (skipToDocument()) {
             throw new YamlParseException(
                 "Multi-document YAML is not supported by parse(), use parseStream() (line " + current().lineNumber() + ")"
             );
@@ -45,15 +52,18 @@ public final class YamlParser {
         return document;
     }
 
+    /**
+     * Parses all documents of the stream; a stream without documents yields an empty {@link YamlStream}.
+     */
     public YamlStream parseStream() {
         reset();
         YamlStream stream = new YamlStream();
-        do {
+        while (skipToDocument()) {
             if (stream.documents().size() >= limits.maxDocuments()) {
                 throw new YamlParseException("YAML document count exceeds configured limit");
             }
             stream.add(parseDocument());
-        } while (!atEnd());
+        }
         return stream;
     }
 
@@ -64,31 +74,70 @@ public final class YamlParser {
         aliasCount = 0;
     }
 
+    /**
+     * Skips comments and stray document end markers between documents.
+     *
+     * @return {@code true} when another document starts at the current line
+     */
+    private boolean skipToDocument() {
+        allowByteOrderMark();
+        while (true) {
+            skipIgnorable();
+            if (index >= lines.size()) {
+                return false;
+            }
+            Line line = current();
+            if (!isDocumentEnd(line)) {
+                return true;
+            }
+            ensureNothingAfterMarker(line);
+            index++;
+            allowByteOrderMark();
+        }
+    }
+
     private YamlDocument parseDocument() {
         String versionDirective = parseDirectives();
         skipIgnorable();
+        YamlNode root;
         if (index < lines.size() && isDocumentStart(current())) {
-            ensureNothingAfterMarker(current());
-            index++;
+            root = parseExplicitDocumentRoot(current());
         } else if (versionDirective != null) {
             throw new YamlParseException("Directives must be followed by a document start marker '---'");
+        } else {
+            root = parseBlockValue(-1, 0, false);
         }
-        YamlNode root = parseBlockValue(-1, 0, false);
         skipIgnorable();
         if (index < lines.size()) {
             Line line = current();
             if (isDocumentEnd(line)) {
-                // A document may be followed by several "..." lines; all of them belong to it.
-                while (index < lines.size() && isDocumentEnd(current())) {
-                    ensureNothingAfterMarker(current());
-                    index++;
-                    skipIgnorable();
-                }
+                ensureNothingAfterMarker(line);
+                index++;
             } else if (!isDocumentStart(line)) {
                 throw new YamlParseException("Unexpected content at line " + line.lineNumber());
             }
         }
         return new YamlDocument(root, versionDirective);
+    }
+
+    private YamlNode parseExplicitDocumentRoot(Line marker) {
+        String content = marker.content();
+        int offset = 3;
+        while (offset < content.length() && isBlank(content.charAt(offset))) {
+            offset++;
+        }
+        String rest = content.substring(offset);
+        if (rest.isEmpty() || rest.startsWith("#")) {
+            index++;
+            return parseBlockValue(-1, 0, false);
+        }
+        // "--- value": the root node starts on the marker line; only scalars may start there.
+        if (isSequenceEntry(rest) || findKeySeparator(rest) >= 0) {
+            throw new YamlParseException("Block collections cannot start on the document start line at line " + marker.lineNumber());
+        }
+        Line root = new Line(marker.lineNumber(), offset, rest, false, false, marker.trailing());
+        lines.set(index, root);
+        return parseNodeAt(root, -1, 0);
     }
 
     private String parseDirectives() {
@@ -99,7 +148,7 @@ public final class YamlParser {
                 return versionDirective;
             }
             Line line = current();
-            if (line.indent() != 0 || !line.content().startsWith("%")) {
+            if (line.indent() != 0 || line.leadingTab() || !line.content().startsWith("%")) {
                 return versionDirective;
             }
             String directive = stripComment(line.content());
@@ -130,7 +179,7 @@ public final class YamlParser {
             return emptyNode();
         }
         if (line.indent() > parentIndent) {
-            return parseNodeAt(line, depth);
+            return parseNodeAt(line, parentIndent, depth);
         }
         if (allowCompactSequence && line.indent() == parentIndent && isSequenceEntry(line.content())) {
             return parseSequence(parentIndent, depth + 1);
@@ -138,15 +187,27 @@ public final class YamlParser {
         return emptyNode();
     }
 
-    private YamlNode parseNodeAt(Line line, int depth) {
-        if (isSequenceEntry(line.content())) {
+    /**
+     * Parses the node that starts on {@code line}.
+     *
+     * @param parentIndent indentation of the enclosing collection; continuation lines of a
+     *                     multi-line scalar must be indented further than this
+     */
+    private YamlNode parseNodeAt(Line line, int parentIndent, int depth) {
+        String content = line.content();
+        boolean sequence = isSequenceEntry(content);
+        boolean mapping = !sequence && findKeySeparator(content) >= 0;
+        if ((sequence || mapping) && line.leadingTab()) {
+            throw tabIndentation(line);
+        }
+        if (sequence) {
             return parseSequence(line.indent(), depth + 1);
         }
-        if (findKeySeparator(line.content()) >= 0) {
+        if (mapping) {
             return parseMapping(line.indent(), depth + 1);
         }
         index++;
-        return parseInlineValue(line.content(), line.lineNumber(), false);
+        return parseInlineValue(content, line.trailing(), line.lineNumber(), parentIndent, false);
     }
 
     private YamlSequence parseSequence(int indent, int depth) {
@@ -164,12 +225,17 @@ public final class YamlParser {
             if (line.indent() > indent) {
                 throw invalidIndentation(line);
             }
+            if (line.leadingTab()) {
+                throw tabIndentation(line);
+            }
             String content = line.content();
             if (!isSequenceEntry(content)) {
                 break;
             }
             int offset = 1;
+            boolean tabSeparated = false;
             while (offset < content.length() && isBlank(content.charAt(offset))) {
+                tabSeparated |= content.charAt(offset) == '\t';
                 offset++;
             }
             String rest = content.substring(offset);
@@ -178,9 +244,10 @@ public final class YamlParser {
                 sequence.add(parseBlockValue(indent, depth, false));
             } else {
                 // Re-read the entry content as if it started its own line at the column after "- ".
-                Line item = new Line(line.lineNumber(), indent + offset, rest, false);
+                // A tab in the separator cannot serve as indentation of a nested block collection.
+                Line item = new Line(line.lineNumber(), indent + offset, rest, tabSeparated, false, line.trailing());
                 lines.set(index, item);
-                sequence.add(parseNodeAt(item, depth));
+                sequence.add(parseNodeAt(item, indent, depth));
             }
         }
         return sequence;
@@ -201,9 +268,15 @@ public final class YamlParser {
             if (line.indent() > indent) {
                 throw invalidIndentation(line);
             }
+            if (line.leadingTab()) {
+                throw tabIndentation(line);
+            }
             String content = line.content();
             if (isSequenceEntry(content)) {
                 throw new YamlParseException("Sequence entry is not allowed inside a mapping at line " + line.lineNumber());
+            }
+            if (isIndicatorWithBlank(content, '?')) {
+                throw new YamlParseException("Complex mapping keys are not supported at line " + line.lineNumber());
             }
             int separator = findKeySeparator(content);
             if (separator < 0) {
@@ -217,7 +290,7 @@ public final class YamlParser {
             String rawValue = trim(content.substring(separator + 1));
             YamlNode value = rawValue.isEmpty() || rawValue.startsWith("#")
                 ? parseBlockValue(indent, depth, true)
-                : parseInlineValue(rawValue, line.lineNumber(), false);
+                : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, false);
             mapping.put(key, value);
         }
         return mapping;
@@ -234,18 +307,24 @@ public final class YamlParser {
         if (key.charAt(0) == '*') {
             throw new YamlParseException("Alias mapping keys are not supported at line " + lineNumber);
         }
-        if (!(parseInlineValue(key, lineNumber, true) instanceof YamlScalar scalar)) {
+        if (!(parseInlineValue(key, "", lineNumber, -1, true) instanceof YamlScalar scalar)) {
             throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
         }
         return scalar;
     }
 
-    private YamlNode parseInlineValue(String raw, int lineNumber, boolean key) {
+    /**
+     * Parses a node written on the current line. The line itself has already been consumed;
+     * multi-line scalars continue on the following lines, which must be indented further than
+     * {@code parentIndent}. Implicit keys are always single-line.
+     */
+    private YamlNode parseInlineValue(String raw, String trailing, int lineNumber, int parentIndent, boolean key) {
         char first = raw.charAt(0);
         if (first == '"' || first == '\'') {
-            return parseQuoted(raw, lineNumber);
+            return parseQuoted(raw, trailing, lineNumber, parentIndent, key);
         }
-        String text = stripComment(raw);
+        int commentStart = findCommentStart(raw);
+        String text = trim(commentStart < 0 ? raw : raw.substring(0, commentStart));
         switch (first) {
             case '*' -> {
                 return parseAlias(text, lineNumber);
@@ -267,28 +346,160 @@ public final class YamlParser {
         if (isIndicatorWithBlank(text, '?')) {
             throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
         }
-        if (!key && hasMappingIndicator(text)) {
+        if (key) {
+            return YamlScalar.plain(text);
+        }
+        if (hasMappingIndicator(text)) {
             throw new YamlParseException("Mapping values are not allowed here at line " + lineNumber + ", quote the value");
         }
-        return YamlScalar.plain(text);
+        // A comment ends a plain scalar, so it cannot continue on the next line.
+        return YamlScalar.plain(commentStart < 0 ? readPlainContinuation(text, parentIndent) : text);
     }
 
-    private YamlScalar parseQuoted(String raw, int lineNumber) {
-        boolean doubleQuoted = raw.charAt(0) == '"';
-        int end = doubleQuoted ? findDoubleQuotedEnd(raw) : findSingleQuotedEnd(raw);
-        if (end < 0) {
-            throw new YamlParseException(
-                "Unterminated " + (doubleQuoted ? "double" : "single") + "-quoted scalar at line " + lineNumber
-            );
+    /**
+     * Folds the continuation lines of a multi-line plain scalar (YAML 1.2.2, 7.3.3 and 6.5):
+     * a single line break becomes a space, and each empty line becomes a line feed.
+     */
+    private String readPlainContinuation(String firstLine, int parentIndent) {
+        StringBuilder value = null;
+        int emptyLines = 0;
+        int resume = index;
+        while (index < lines.size()) {
+            Line line = current();
+            String content = line.content();
+            if (content.isEmpty()) {
+                emptyLines++;
+                index++;
+                continue;
+            }
+            if (content.startsWith("#") || isDocumentMarker(line) || line.indent() <= parentIndent) {
+                break;
+            }
+            int commentStart = findCommentStart(content);
+            String part = trim(commentStart < 0 ? content : content.substring(0, commentStart));
+            if (hasMappingIndicator(part)) {
+                throw new YamlParseException("Mapping values are not allowed here at line " + line.lineNumber() + ", quote the value");
+            }
+            if (value == null) {
+                value = new StringBuilder(firstLine);
+            }
+            value.append(emptyLines == 0 ? " " : "\n".repeat(emptyLines)).append(part);
+            emptyLines = 0;
+            index++;
+            resume = index;
+            if (commentStart >= 0) {
+                break;
+            }
         }
-        String trailing = raw.substring(end + 1);
-        if (!trim(trailing).isEmpty() && !(isBlank(trailing.charAt(0)) && trim(trailing).startsWith("#"))) {
+        // Empty lines after the last continuation line are not part of the scalar.
+        index = resume;
+        return value == null ? firstLine : value.toString();
+    }
+
+    private YamlScalar parseQuoted(String raw, String trailing, int lineNumber, int parentIndent, boolean key) {
+        boolean doubleQuoted = raw.charAt(0) == '"';
+        YamlScalarStyle style = doubleQuoted ? YamlScalarStyle.DOUBLE_QUOTED : YamlScalarStyle.SINGLE_QUOTED;
+        int end = findQuoteEnd(raw, 1, doubleQuoted);
+        if (end >= 0) {
+            ensureOnlyComment(raw.substring(end + 1), lineNumber);
+            String body = raw.substring(1, end);
+            String value = doubleQuoted ? unescape(body, lineNumber) : body.replace("''", "'");
+            return new YamlScalar(value, null, null, style);
+        }
+        if (key) {
+            throw unterminatedQuote(doubleQuoted, lineNumber);
+        }
+        List<Segment> segments = new ArrayList<>();
+        segments.add(new Segment(raw.substring(1) + trailing, lineNumber));
+        while (true) {
+            if (index >= lines.size()) {
+                throw unterminatedQuote(doubleQuoted, lineNumber);
+            }
+            Line line = current();
+            if (isDocumentMarker(line)) {
+                throw new YamlParseException("Document marker inside a quoted scalar at line " + line.lineNumber());
+            }
+            if (!line.content().isEmpty() && line.indent() <= parentIndent) {
+                throw new YamlParseException("Invalid indentation of a quoted scalar continuation at line " + line.lineNumber());
+            }
+            index++;
+            String segment = line.content() + line.trailing();
+            end = findQuoteEnd(segment, 0, doubleQuoted);
+            if (end >= 0) {
+                ensureOnlyComment(segment.substring(end + 1), line.lineNumber());
+                segments.add(new Segment(segment.substring(0, end), line.lineNumber()));
+                return new YamlScalar(foldQuoted(segments, doubleQuoted), null, null, style);
+            }
+            segments.add(new Segment(segment, line.lineNumber()));
+        }
+    }
+
+    /**
+     * Folds the lines of a multi-line quoted scalar (YAML 1.2.2, 7.3.1, 7.3.2 and 6.5). Leading
+     * white space of continuation lines is already removed by the tokenizer; trailing white space
+     * before a line break is removed unless the break is escaped.
+     */
+    private String foldQuoted(List<Segment> segments, boolean doubleQuoted) {
+        StringBuilder result = new StringBuilder();
+        int last = segments.size() - 1;
+        boolean escapedBreak = false;
+        int emptyLines = 0;
+        for (int i = 0; i <= last; i++) {
+            Segment segment = segments.get(i);
+            String text = segment.text();
+            if (i > 0 && i < last && trim(text).isEmpty()) {
+                emptyLines++;
+                continue;
+            }
+            if (i > 0) {
+                if (emptyLines > 0) {
+                    result.append("\n".repeat(emptyLines));
+                } else if (!escapedBreak) {
+                    result.append(' ');
+                }
+                emptyLines = 0;
+            }
+            if (i < last) {
+                escapedBreak = doubleQuoted && endsWithEscapedLineBreak(text);
+                text = escapedBreak ? text.substring(0, text.length() - 1) : trimTrailingUnescaped(text, doubleQuoted);
+            }
+            result.append(doubleQuoted ? unescape(text, segment.lineNumber()) : text.replace("''", "'"));
+        }
+        return result.toString();
+    }
+
+    private static boolean endsWithEscapedLineBreak(String text) {
+        return !text.isEmpty() && text.charAt(text.length() - 1) == '\\' && !isEscaped(text, text.length() - 1);
+    }
+
+    private static String trimTrailingUnescaped(String text, boolean doubleQuoted) {
+        int end = text.length();
+        while (end > 0 && isBlank(text.charAt(end - 1)) && !(doubleQuoted && isEscaped(text, end - 1))) {
+            end--;
+        }
+        return text.substring(0, end);
+    }
+
+    /**
+     * Whether the character at {@code position} is preceded by an odd number of backslashes.
+     */
+    private static boolean isEscaped(String text, int position) {
+        int backslashes = 0;
+        for (int i = position - 1; i >= 0 && text.charAt(i) == '\\'; i--) {
+            backslashes++;
+        }
+        return (backslashes & 1) == 1;
+    }
+
+    private static void ensureOnlyComment(String trailing, int lineNumber) {
+        String rest = trim(trailing);
+        if (!rest.isEmpty() && !(isBlank(trailing.charAt(0)) && rest.startsWith("#"))) {
             throw new YamlParseException("Unexpected content after quoted scalar at line " + lineNumber);
         }
-        String body = raw.substring(1, end);
-        return doubleQuoted
-            ? new YamlScalar(unescape(body, lineNumber), null, null, YamlScalarStyle.DOUBLE_QUOTED)
-            : new YamlScalar(body.replace("''", "'"), null, null, YamlScalarStyle.SINGLE_QUOTED);
+    }
+
+    private static YamlParseException unterminatedQuote(boolean doubleQuoted, int lineNumber) {
+        return new YamlParseException("Unterminated " + (doubleQuoted ? "double" : "single") + "-quoted scalar at line " + lineNumber);
     }
 
     private YamlAlias parseAlias(String text, int lineNumber) {
@@ -371,18 +582,26 @@ public final class YamlParser {
     }
 
     private void skipIgnorable() {
-        while (index < lines.size() && lines.get(index).ignorable()) {
+        while (index < lines.size() && current().ignorable()) {
             index++;
         }
     }
 
-    private boolean atEnd() {
-        skipIgnorable();
-        return index >= lines.size();
+    /**
+     * A byte order mark may only appear at the start of a document (YAML 1.2.2, 5.2 and 9.1.1).
+     */
+    private void allowByteOrderMark() {
+        if (index < lines.size() && lines.get(index).bom()) {
+            lines.set(index, lines.get(index).withoutByteOrderMark());
+        }
     }
 
     private Line current() {
-        return lines.get(index);
+        Line line = lines.get(index);
+        if (line.bom()) {
+            throw new YamlParseException("Byte order mark is only allowed at the start of a document (line " + line.lineNumber() + ")");
+        }
+        return line;
     }
 
     private void ensureDepth(int depth) {
@@ -393,12 +612,16 @@ public final class YamlParser {
 
     private void ensureNothingAfterMarker(Line line) {
         if (!stripComment(line.content().substring(3)).isEmpty()) {
-            throw new YamlParseException("Content on a document marker line is not supported at line " + line.lineNumber());
+            throw new YamlParseException("Content on a document end marker line is not allowed at line " + line.lineNumber());
         }
     }
 
     private static YamlParseException invalidIndentation(Line line) {
         return new YamlParseException("Invalid indentation at line " + line.lineNumber());
+    }
+
+    private static YamlParseException tabIndentation(Line line) {
+        return new YamlParseException("Tabs are not supported for indentation at line " + line.lineNumber());
     }
 
     private static YamlScalar emptyNode() {
@@ -420,6 +643,7 @@ public final class YamlParser {
     private static boolean isMarker(Line line, String marker) {
         String content = line.content();
         return line.indent() == 0
+            && !line.leadingTab()
             && content.startsWith(marker)
             && (content.length() == marker.length() || isBlank(content.charAt(marker.length())));
     }
@@ -440,7 +664,7 @@ public final class YamlParser {
         }
         char first = content.charAt(0);
         if (first == '"' || first == '\'') {
-            int end = first == '"' ? findDoubleQuotedEnd(content) : findSingleQuotedEnd(content);
+            int end = findQuoteEnd(content, 1, first == '"');
             if (end < 0) {
                 return -1;
             }
@@ -476,21 +700,19 @@ public final class YamlParser {
             && (i + 1 == text.length() || isBlank(text.charAt(i + 1)));
     }
 
-    private static int findDoubleQuotedEnd(String text) {
-        for (int i = 1; i < text.length(); i++) {
+    /**
+     * Finds the closing quote, scanning from {@code from}; returns -1 when the scalar continues on the next line.
+     */
+    private static int findQuoteEnd(String text, int from, boolean doubleQuoted) {
+        for (int i = from; i < text.length(); i++) {
             char ch = text.charAt(i);
-            if (ch == '\\') {
-                i++;
-            } else if (ch == '"') {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private static int findSingleQuotedEnd(String text) {
-        for (int i = 1; i < text.length(); i++) {
-            if (text.charAt(i) == '\'') {
+            if (doubleQuoted) {
+                if (ch == '\\') {
+                    i++;
+                } else if (ch == '"') {
+                    return i;
+                }
+            } else if (ch == '\'') {
                 if (i + 1 < text.length() && text.charAt(i + 1) == '\'') {
                     i++;
                 } else {
@@ -501,13 +723,21 @@ public final class YamlParser {
         return -1;
     }
 
-    private static String stripComment(String text) {
+    /**
+     * Position of a comment ({@code #} at the start or after white space), or -1.
+     */
+    private static int findCommentStart(String text) {
         for (int i = 0; i < text.length(); i++) {
             if (text.charAt(i) == '#' && (i == 0 || isBlank(text.charAt(i - 1)))) {
-                return trim(text.substring(0, i));
+                return i;
             }
         }
-        return trim(text);
+        return -1;
+    }
+
+    private static String stripComment(String text) {
+        int commentStart = findCommentStart(text);
+        return trim(commentStart < 0 ? text : text.substring(0, commentStart));
     }
 
     private static String trim(String text) {
@@ -527,11 +757,10 @@ public final class YamlParser {
     }
 
     private static List<Line> tokenize(String text) {
-        int start = text.startsWith("﻿") ? 1 : 0;
         List<Line> result = new ArrayList<>();
         int lineNumber = 1;
-        int lineStart = start;
-        for (int i = start; i <= text.length(); i++) {
+        int lineStart = 0;
+        for (int i = 0; i <= text.length(); i++) {
             if (i == text.length() || text.charAt(i) == '\n' || text.charAt(i) == '\r') {
                 result.add(parseLine(text.substring(lineStart, i), lineNumber++));
                 if (i < text.length() && text.charAt(i) == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') {
@@ -544,18 +773,69 @@ public final class YamlParser {
     }
 
     private static Line parseLine(String raw, int lineNumber) {
+        boolean bom = raw.startsWith("﻿");
+        String line = bom ? raw.substring(1) : raw;
+        ensurePrintable(line, lineNumber);
         int indent = 0;
-        while (indent < raw.length() && raw.charAt(indent) == ' ') {
+        while (indent < line.length() && line.charAt(indent) == ' ') {
             indent++;
         }
-        String rest = raw.substring(indent);
-        String content = trim(rest);
-        if (!rest.isEmpty() && rest.charAt(0) == '\t' && !content.isEmpty() && !content.startsWith("#")) {
-            throw new YamlParseException("Tabs are not supported for indentation at line " + lineNumber);
+        // White space after the indentation separates content but is not indentation itself.
+        int start = indent;
+        boolean leadingTab = false;
+        while (start < line.length() && isBlank(line.charAt(start))) {
+            leadingTab |= line.charAt(start) == '\t';
+            start++;
         }
-        return new Line(lineNumber, indent, content, content.isEmpty() || content.startsWith("#"));
+        int end = line.length();
+        while (end > start && isBlank(line.charAt(end - 1))) {
+            end--;
+        }
+        String content = line.substring(start, end);
+        return new Line(lineNumber, indent, content, leadingTab && !content.isEmpty(), bom, line.substring(end));
     }
 
-    private record Line(int lineNumber, int indent, String content, boolean ignorable) {
+    /**
+     * Rejects characters outside the YAML printable set (YAML 1.2.2, 5.1); line breaks are handled by the tokenizer.
+     */
+    private static void ensurePrintable(String line, int lineNumber) {
+        for (int i = 0; i < line.length(); ) {
+            int codePoint = line.codePointAt(i);
+            if (codePoint == 0xFEFF) {
+                throw new YamlParseException("Byte order mark is only allowed at the start of a document (line " + lineNumber + ")");
+            }
+            boolean printable = codePoint == '\t'
+                || codePoint >= 0x20 && codePoint <= 0x7E
+                || codePoint == 0x85
+                || codePoint >= 0xA0 && codePoint <= 0xD7FF
+                || codePoint >= 0xE000 && codePoint <= 0xFFFD
+                || codePoint >= 0x10000 && codePoint <= 0x10FFFF;
+            if (!printable) {
+                throw new YamlParseException(String.format("Non-printable character U+%04X at line %d", codePoint, lineNumber));
+            }
+            i += Character.charCount(codePoint);
+        }
+    }
+
+    /**
+     * One physical line.
+     *
+     * @param indent     number of leading spaces
+     * @param content    text after the indentation and any separating white space, without trailing white space
+     * @param leadingTab whether a tab separates the indentation from non-empty content
+     * @param bom        whether the line starts with a byte order mark
+     * @param trailing   trailing white space removed from the content (significant in quoted scalars)
+     */
+    private record Line(int lineNumber, int indent, String content, boolean leadingTab, boolean bom, String trailing) {
+        boolean ignorable() {
+            return content.isEmpty() || content.startsWith("#");
+        }
+
+        Line withoutByteOrderMark() {
+            return new Line(lineNumber, indent, content, leadingTab, false, trailing);
+        }
+    }
+
+    private record Segment(String text, int lineNumber) {
     }
 }

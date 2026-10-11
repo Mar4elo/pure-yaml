@@ -87,16 +87,24 @@ The current parser/writer supports a safe, practical subset of YAML:
 - document start marker `---`
 - document end marker `...`
 - block mappings and block sequences with any consistent indentation
+- multi-line plain, single-quoted and double-quoted scalars with YAML line folding
+  (a single line break becomes a space, each empty line becomes a line feed, `\` escapes a line break)
+- tabs as separators after indentation (for example `key:\tvalue` or a tab before a continuation line);
+  tabs are never accepted as indentation
+- a scalar on the document start line (`--- value`)
 - compact sequences under a mapping key (`key:` followed by `- item` at the same indentation)
 - nested sequence entries on one line (`- - item`, `- key: value`)
 - empty values (`key:` or `-`), read as null
+- streams without documents (empty input, only comments or `...`): `parseStream` returns no documents,
+  `parse` returns a document with an empty (null) root
 - empty flow collections `[]` and `{}`
 - scalar mapping keys
 - plain scalars
 - single-quoted scalars
 - double-quoted scalars with the full YAML escape set (`\0`, `\n`, `\t`, `\xXX`, `\uXXXX`, `\UXXXXXXXX`, ...)
 - comments
-- UTF-8 text input
+- UTF-8 text input; a byte order mark is accepted only at the start of a document, and characters
+  outside the YAML printable set are rejected
 - alias nodes as parsed syntax objects
 
 Input that falls outside this subset is rejected with a `YamlParseException` that names the line.
@@ -108,7 +116,8 @@ These are currently rejected or intentionally left disabled:
 
 - multi-document streams in `parse()` (use `parseStream()` with an explicit `maxDocuments`)
 - non-empty flow collections like `[1, 2]` and `{a: 1}`
-- block scalars (`|`, `>`) and multi-line plain or quoted scalars
+- block scalars (`|`, `>`)
+- block collections on the document start line (`--- key: value`), empty keys (`: value`)
 - anchors (`&name`), tags (`!tag`) and `%TAG` directives
 - complex mapping keys (`? key`)
 - merge keys
@@ -591,6 +600,25 @@ mvn test
 - JaCoCo: coverage report in `target/site/jacoco` and minimum line/branch coverage
 - SpotBugs: static analysis, with justified exclusions in `spotbugs-exclude.xml`
 
+### YAML test suite
+
+`YamlTestSuiteTest` runs the official [yaml-test-suite](https://github.com/yaml/yaml-test-suite)
+when its `data` branch is available locally (CI pins the commit in `.github/workflows/build.yml`):
+
+```bash
+git clone --branch data https://github.com/yaml/yaml-test-suite.git /tmp/yaml-test-suite
+YAML_TEST_SUITE_DIR=/tmp/yaml-test-suite mvn verify
+```
+
+The test fails when invalid YAML is accepted, when a parsed tree differs from the expected JSON,
+or when valid YAML is rejected without being listed in
+`src/test/resources/yaml-test-suite/unsupported-cases.txt`. That file lists the cases that use
+syntax outside the supported subset; a case must be removed from it once it starts to pass.
+
+Current results: 116 of 308 valid documents are parsed and match the expected JSON, the remaining
+192 use unsupported syntax (flow collections, block scalars, anchors, tags, complex or empty keys);
+all 94 invalid documents are rejected.
+
 ## Limitations
 
 Before using this library in production, be aware of the current scope:
@@ -598,7 +626,7 @@ Before using this library in production, be aware of the current scope:
 - not a full YAML 1.2 implementation
 - not yet a general-purpose replacement for mature YAML libraries
 - only empty flow-style collections (`[]`, `{}`)
-- no block scalars or multi-line scalars
+- no block scalars
 - no merge-key support
 - no tag-driven object model
 - no alias resolution for object binding
@@ -609,7 +637,7 @@ Before using this library in production, be aware of the current scope:
 Planned directions include:
 
 1. anchors and aliases as first-class graph resolution
-2. flow collections, block scalars and multi-line scalars
+2. flow collections and block scalars
 3. merge-key policy support
 4. broader YAML 1.2 compatibility
 5. additional performance tuning for large inputs

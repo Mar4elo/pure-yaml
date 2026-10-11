@@ -151,8 +151,14 @@ class YamlWriterTest {
         assertEquals(1, ((YamlMapping) Yaml.parse("{" + longest + "k: v}")).size());
 
         assertEquals(longest + ": v", Yaml.stringify(map(longest, plain("v"))));
-        assertThrows(YamlWriteException.class, () -> Yaml.stringify(map(longest + "k", plain("v"))));
-        assertThrows(YamlWriteException.class, () -> YamlMapper.createDefault().writeValueAsString(Map.of(longest + "k", 1)));
+        // Longer keys are written as explicit entries, which are not limited.
+        String explicit = Yaml.stringify(map(longest + "k", plain("v")));
+        assertEquals("? " + longest + "k\n: v", explicit);
+        assertEquals("v", ((YamlScalar) ((YamlMapping) Yaml.parse(explicit)).get(longest + "k")).value());
+        YamlMapper mapper = YamlMapper.createDefault();
+        Map<String, Integer> longKeys = Map.of(longest + "k", 1);
+        assertEquals(longKeys, mapper.readValue(mapper.writeValueAsString(longKeys), new io.pure.yaml.binding.mapper.YamlTypeRef<Map<String, Integer>>() {
+        }));
     }
 
     private static void assertSameValues(YamlNode expected, YamlNode actual) {

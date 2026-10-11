@@ -26,7 +26,8 @@ This project takes that seriously and starts from a safer subset first:
 
 - single-document input by default (multi-document streams only through `parseStream` with an explicit limit)
 - no implicit object construction
-- no custom tag resolution: tags and other unsupported syntax are rejected instead of being read as text
+- tags never construct objects: core schema tags (`!!str`, `!!int`, ...) are hints for value resolution,
+  other tags are kept as metadata; unsupported syntax is rejected instead of being read as text
 - duplicate mapping keys are rejected
 - aliases must refer to an anchor defined earlier in the same document; recursive aliases are rejected
 - alias resolution in Java binding is opt-in and bounded by expansion and depth limits
@@ -103,14 +104,19 @@ The current parser/writer supports a safe, practical subset of YAML:
 - literal (`|`) and folded (`>`) block scalars with chomping (`-`, `+`) and indentation indicators
 - anchors (`&name`) on scalars, collections and keys, and aliases (`*name`), including alias keys
   whose anchor is a scalar
-- scalar mapping keys
+- tags: shorthands (`!local`, `!!str`, `!e!name` declared by `%TAG`), verbatim tags (`!<tag:...>`) and the
+  non-specific tag `!`, on any node; `%TAG` directives are scoped to their document
+- scalar mapping keys, including explicit entries (`? key` / `: value`, also in flow collections and
+  with block scalar or multi-line keys) and empty keys (`: value`)
 - plain scalars
 - single-quoted scalars
-- implicit keys of up to 1024 characters, as YAML requires
+- implicit keys of up to 1024 characters, as YAML requires (the writer uses `? key` for longer keys)
 - double-quoted scalars with the full YAML escape set (`\0`, `\n`, `\t`, `\xXX`, `\uXXXX`, `\UXXXXXXXX`, ...)
 - comments
-- UTF-8 text input; a byte order mark is accepted only at the start of a document, and characters
-  outside the YAML printable set are rejected
+- text, or bytes in UTF-8, UTF-16 or UTF-32 with the encoding detected from the byte order mark or
+  the first character (`Yaml.parse(byte[])`, `Yaml.parseStream(InputStream, limits)`,
+  `YamlMapper.readValue(byte[] | InputStream, ...)`); a byte order mark is accepted only at the start of
+  a document, and characters outside the YAML printable set are rejected
 - fragment identifiers of RFC 9512 (`*anchor` and JSON Pointer) through `YamlFragment`
 
 Input that falls outside this subset is rejected with a `YamlParseException` that names the line.
@@ -121,9 +127,10 @@ The parser never silently skips or reinterprets content.
 These are currently rejected or intentionally left disabled:
 
 - multi-document streams in `parse()` (use `parseStream()` with an explicit `maxDocuments`)
-- block collections on the document start line (`--- key: value`), empty keys (`: value`)
-- tags (`!tag`, `!!str`) and `%TAG` directives
-- complex mapping keys (`? key`) and non-scalar keys such as `[a, b]: value`
+- block collections on the document start line (`--- key: value`)
+- non-scalar mapping keys such as `[a, b]: value` or `? {a: 1}`
+- duplicate keys, including two empty keys in one mapping
+- object construction from tags (local and unknown tags are kept only as metadata)
 - recursive aliases (an alias inside the node its anchor belongs to)
 - merge keys (`<<`)
 - custom tags for object construction
@@ -465,6 +472,14 @@ YamlMapper mapper = YamlMapper.builder()
 numeric and boolean targets. It is enabled by default; disable it to require unquoted values, as the
 YAML 1.2 core schema does.
 
+### Tags
+
+Tags of the YAML 1.2 core schema guide how a scalar is read: `!!str 123` and `! 123` are the text
+`"123"`, `!!int "0x1F"` is 31, `!!float 1` is `1.0`, `!!bool "true"` is `true`, and `!!null ""` is null; a
+value that contradicts its tag (such as `!!int abc`, or `!!map` on a sequence) is an error. Local and
+unknown tags (`!thing`, `!<tag:example.com,2000:x>`) are kept in the tree (`YamlNode.tag()`) and written
+back, but never select a Java type: the target type alone decides how a node is bound.
+
 ### Anchors and aliases
 
 The parser links every alias to the node its anchor belongs to (`YamlAlias.target()`); an alias to an
@@ -566,8 +581,9 @@ In practice, this project uses RFC 9512 as the guiding safety and interoperabili
 - fragment identifiers (section 1.2): `*anchor` and JSON Pointer fragments through `YamlFragment`
 - multi-document streams (section 3.2): `parse()` signals an error instead of ignoring extra
   documents, and anchors are scoped to their document
+- encodings: UTF-8, UTF-16 and UTF-32 input is detected and decoded; output bytes are UTF-8
 - JSON interoperability (section 3.4): flow collections make JSON documents readable; keys are
-  scalars, and tags and cyclic references are not supported
+  scalars, tags do not construct objects, and cyclic references are not supported
 - resource exhaustion (section 4.2): parser limits, alias expansion and depth limits, no cycles
 
 Reference:
@@ -684,16 +700,17 @@ git clone --branch data https://github.com/yaml/yaml-test-suite.git /tmp/yaml-te
 YAML_TEST_SUITE_DIR=/tmp/yaml-test-suite mvn verify
 ```
 
-The test fails when invalid YAML is accepted, when a parsed tree differs from the expected JSON,
-or when valid YAML is rejected without being listed in
+The test reads each case as bytes and fails when invalid YAML is accepted, when the parsed
+representation differs from the expected events (anchors, tags, scalar styles and values) or from
+the expected JSON, or when valid YAML is rejected without being listed in
 `src/test/resources/yaml-test-suite/unsupported-cases.txt`. That file lists the cases that use
 syntax outside the supported subset; a case must be removed from it once it starts to pass.
 Every parsed stream is also written with `Yaml.stringify` and read back, and must yield the same
-representation.
+events apart from scalar styles.
 
-Current results: 235 of 308 valid documents are parsed and match the expected JSON; the remaining
-73 use unsupported syntax (tags, complex, empty or non-scalar keys); all 94 invalid documents are
-rejected. All 235 parsed streams survive the writer round trip.
+Current results: 292 of 308 valid documents are parsed and match the expected events and JSON; the
+remaining 16 use non-scalar mapping keys (15) or two empty keys in one mapping (1); all 94 invalid
+documents are rejected. All 292 parsed streams survive the writer round trip.
 
 ## Limitations
 
@@ -701,9 +718,9 @@ Before using this library in production, be aware of the current scope:
 
 - not a full YAML 1.2 implementation
 - not yet a general-purpose replacement for mature YAML libraries
-- no tags, complex keys or non-scalar keys
+- no non-scalar mapping keys
 - no merge-key support
-- no tag-driven object model
+- no tag-driven object model (by design)
 - alias resolution for object binding is opt-in
 - the writer always uses block style; folded scalars are written as literal blocks
 - no streaming read/write API for very large documents
@@ -712,9 +729,9 @@ Before using this library in production, be aware of the current scope:
 
 Planned directions include:
 
-1. tags with an explicit, safe resolution policy
-2. complex and non-scalar mapping keys
-3. merge-key policy support
+1. non-scalar mapping keys
+2. merge-key policy support
+3. failsafe and JSON schemas as alternatives to the core schema
 4. broader YAML 1.2 compatibility
 5. additional performance tuning for large inputs
 6. clearer module publishing story and versioning discipline

@@ -175,7 +175,6 @@ class YamlFlowAndBlockScalarTest {
         assertThrows(YamlParseException.class, () -> Yaml.parse("a: |#comment\n  x"));
         assertThrows(YamlParseException.class, () -> Yaml.parse("a: |\n    \n  x"));
         assertThrows(YamlParseException.class, () -> Yaml.parse("[|\n  x\n]"));
-        assertThrows(YamlParseException.class, () -> Yaml.parse("? |\n  x\n: y"));
     }
 
     @Test
@@ -185,7 +184,7 @@ class YamlFlowAndBlockScalarTest {
         assertThrows(YamlParseException.class, () -> Yaml.parse("[a] b"));
         assertThrows(YamlParseException.class, () -> Yaml.parse("[a]#comment"));
         assertThrows(YamlParseException.class, () -> Yaml.parse("key: {a: 1,\n...\n}"));
-        assertThrows(YamlParseException.class, () -> Yaml.parse("[: empty key]"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("{: a, : b}"));
     }
 
     private static String text(YamlNode node) {

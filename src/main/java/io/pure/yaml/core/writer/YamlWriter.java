@@ -14,10 +14,12 @@ import io.pure.yaml.core.model.YamlScalar;
 import io.pure.yaml.core.model.YamlScalarStyle;
 import io.pure.yaml.core.model.YamlSequence;
 import io.pure.yaml.core.model.YamlStream;
+import io.pure.yaml.core.model.YamlTags;
 
 public final class YamlWriter {
     private static final String PLAIN_FORBIDDEN_FIRST = ",[]{}#&*!|>'\"%@`";
     private static final int MAX_IMPLICIT_KEY_LENGTH = 1024;
+    private static final String URI_SAFE_PUNCTUATION = "-#;/?:@&=+$_.~*'()";
 
     private final String indentUnit;
 
@@ -89,7 +91,7 @@ public final class YamlWriter {
             appendInline(builder, node, new Position(-1, indentUnit.length()), state);
             builder.append('\n');
         } else {
-            if (appendAnchor(builder, node, state)) {
+            if (appendProperties(builder, node, state)) {
                 // Properties of a block collection stand on their own line.
                 builder.setLength(builder.length() - 1);
                 builder.append('\n');
@@ -145,8 +147,8 @@ public final class YamlWriter {
             if (isInline(item)) {
                 appendInline(builder, item, new Position(column, column + 2), state);
                 builder.append('\n');
-            } else if (appendAnchor(builder, item, state)) {
-                // "- &anchor" followed by the collection on the next lines.
+            } else if (appendProperties(builder, item, state)) {
+                // "- &anchor !tag" followed by the collection on the next lines.
                 builder.setLength(builder.length() - 1);
                 builder.append('\n');
                 appendBlock(builder, item, column + 2, false, state);
@@ -163,16 +165,24 @@ public final class YamlWriter {
                 indent(builder, column);
             }
             first = false;
-            appendKey(builder, entry.key(), state);
+            String key = renderKey(entry.key(), state);
+            if (key.codePointCount(0, key.length()) > MAX_IMPLICIT_KEY_LENGTH) {
+                // Implicit keys are limited to 1024 characters (YAML 1.2.2, 7.4.2 and 8.2.1); longer keys
+                // are written as explicit entries: "? key" followed by ": value".
+                builder.append("? ").append(key).append('\n');
+                indent(builder, column);
+            } else {
+                builder.append(key);
+            }
             builder.append(':');
             if (isInline(entry.value())) {
                 builder.append(' ');
                 appendInline(builder, entry.value(), new Position(column, column + indentUnit.length()), state);
                 builder.append('\n');
             } else {
-                if (entry.value().anchor() != null) {
+                if (hasProperties(entry.value())) {
                     builder.append(' ');
-                    appendAnchor(builder, entry.value(), state);
+                    appendProperties(builder, entry.value(), state);
                     builder.setLength(builder.length() - 1);
                 }
                 builder.append('\n');
@@ -181,23 +191,22 @@ public final class YamlWriter {
         }
     }
 
-    private void appendKey(StringBuilder builder, YamlNode key, State state) {
+    private String renderKey(YamlNode key, State state) {
         state.endsWithKeptLines = false;
         StringBuilder rendered = new StringBuilder();
         if (key instanceof YamlAlias alias) {
             appendAlias(rendered, alias, state);
             // Anchor names may contain ':', so the separator must not touch the alias.
             rendered.append(' ');
-        } else if (key instanceof YamlScalar scalar && scalar.value() != null) {
+        } else if (key instanceof YamlScalar scalar && scalar.value() == null) {
+            // An empty key: only its properties, followed by white space before ':'.
+            appendProperties(rendered, scalar, state);
+        } else if (key instanceof YamlScalar scalar) {
             appendInline(rendered, scalar, null, state);
         } else {
-            throw new YamlWriteException("Current writer supports only non-empty scalar mapping keys");
+            throw new YamlWriteException("Current writer supports only scalar mapping keys");
         }
-        // Implicit keys are limited to 1024 characters (YAML 1.2.2, 7.4.2 and 8.2.1).
-        if (rendered.codePointCount(0, rendered.length()) > MAX_IMPLICIT_KEY_LENGTH) {
-            throw new YamlWriteException("Mapping key is longer than " + MAX_IMPLICIT_KEY_LENGTH + " characters");
-        }
-        builder.append(rendered);
+        return rendered.toString();
     }
 
     private static boolean isInline(YamlNode node) {
@@ -214,12 +223,12 @@ public final class YamlWriter {
      */
     private void appendInline(StringBuilder builder, YamlNode node, Position position, State state) {
         state.endsWithKeptLines = false;
-        boolean anchored = appendAnchor(builder, node, state);
+        boolean withProperties = appendProperties(builder, node, state);
         switch (node) {
             case YamlScalar scalar -> {
                 if (scalar.value() == null) {
-                    // An empty node: nothing follows the indicator or the anchor.
-                    if (anchored) {
+                    // An empty node: nothing follows the indicator or the properties.
+                    if (withProperties) {
                         builder.setLength(builder.length() - 1);
                     } else if (!builder.isEmpty() && builder.charAt(builder.length() - 1) == ' ') {
                         builder.setLength(builder.length() - 1);
@@ -293,26 +302,57 @@ public final class YamlWriter {
         return true;
     }
 
+    private static boolean hasProperties(YamlNode node) {
+        return node.anchor() != null || node.tag() != null;
+    }
+
     /**
-     * Writes "&amp;name " when the node has an anchor and records the anchor as defined.
+     * Writes "&amp;anchor !tag " for the properties the node has and records the anchor as defined.
      *
-     * @return whether an anchor was written
+     * @return whether any property was written
      */
-    private boolean appendAnchor(StringBuilder builder, YamlNode node, State state) {
-        if (node.tag() != null) {
-            throw new YamlWriteException("Tags are not supported by the writer");
-        }
-        String anchor = node.anchor();
-        if (anchor == null) {
+    private boolean appendProperties(StringBuilder builder, YamlNode node, State state) {
+        if (!hasProperties(node)) {
             return false;
         }
         if (node instanceof YamlAlias) {
-            throw new YamlWriteException("An alias cannot have an anchor");
+            throw new YamlWriteException("An alias cannot have an anchor or a tag");
         }
-        ensureValidAnchorName(anchor);
-        state.definedAnchors.add(anchor);
-        builder.append('&').append(anchor).append(' ');
+        String anchor = node.anchor();
+        if (anchor != null) {
+            ensureValidAnchorName(anchor);
+            state.definedAnchors.add(anchor);
+            builder.append('&').append(anchor).append(' ');
+        }
+        if (node.tag() != null) {
+            builder.append(formatTag(node.tag())).append(' ');
+        }
         return true;
+    }
+
+    /**
+     * Writes a tag as {@code !!suffix} for core schema tags, {@code !suffix} for local tags, the
+     * non-specific {@code !}, or verbatim {@code !<tag>} otherwise (YAML 1.2.2, 6.9.1).
+     */
+    private static String formatTag(String tag) {
+        if (tag.equals(YamlTags.NON_SPECIFIC)) {
+            return "!";
+        }
+        if (tag.startsWith(YamlTags.CORE_PREFIX) && isShorthandSuffix(tag.substring(YamlTags.CORE_PREFIX.length()))) {
+            return "!!" + tag.substring(YamlTags.CORE_PREFIX.length());
+        }
+        if (tag.startsWith("!") && isShorthandSuffix(tag.substring(1))) {
+            return tag;
+        }
+        if (tag.isEmpty() || tag.chars().anyMatch(ch -> ch == '<' || ch == '>' || ch <= ' ' || ch == 0x7F)) {
+            throw new YamlWriteException("Tag cannot be written: " + tag);
+        }
+        return "!<" + tag + ">";
+    }
+
+    private static boolean isShorthandSuffix(String suffix) {
+        return !suffix.isEmpty() && suffix.chars().allMatch(ch -> ch < 0x80
+            && (Character.isLetterOrDigit(ch) || URI_SAFE_PUNCTUATION.indexOf(ch) >= 0));
     }
 
     private void appendAlias(StringBuilder builder, YamlAlias alias, State state) {

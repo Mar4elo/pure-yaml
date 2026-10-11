@@ -133,8 +133,8 @@ class YamlCoreTest {
     @Test
     void rejectsUnsupportedFlowCollections() {
         assertThrows(YamlParseException.class, () -> Yaml.parse("{[a, b]: c}"));
-        assertThrows(YamlParseException.class, () -> Yaml.parse("[? a : b]"));
-        assertThrows(YamlParseException.class, () -> Yaml.parse("[!!str a]"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("[? [a] : b]"));
+        assertThrows(YamlParseException.class, () -> Yaml.parse("{? {a: b} : c}"));
     }
 
     @Test
@@ -391,13 +391,17 @@ class YamlCoreTest {
         "[a, |\n  b]",
         "&a - x",
         "a: &b[1]",
-        "a: !!str value",
+        "a: !e!x value",
+        "a: !!str !!int 1",
+        "a: !<> value",
+        "%TAG !e! tag:a,2000:\n%TAG !e! tag:b,2000:\n---\na: 1",
+        "%TAG !e tag:a,2000:\n---\na: 1",
+        "? [complex]\n: value",
+        ": a\n: b",
         "a: b: c",
         "a: \"x\" y",
         "a: - b",
-        "? complex\n: value",
         "a: 1\na: 2",
-        "%TAG ! tag:example.com,2000:\n---\na: 1",
         "%YAML 2.0\n---\na: 1",
         "%YAML 1.2\na: 1",
         "--- a: b\n",
@@ -506,8 +510,8 @@ class YamlCoreTest {
     }
 
     @Test
-    void rejectsTagsAndUndefinedAliasesOnWrite() {
-        assertThrows(YamlWriteException.class, () -> Yaml.stringify(new YamlScalar("v", "!custom", null, YamlScalarStyle.PLAIN)));
+    void rejectsUndefinedAliasesAndUnwritableTagsOnWrite() {
+        assertThrows(YamlWriteException.class, () -> Yaml.stringify(new YamlScalar("v", "a tag with spaces", null, YamlScalarStyle.PLAIN)));
         assertThrows(YamlWriteException.class, () -> Yaml.stringify(sequence(new YamlAlias("missing"))));
         YamlSequence aliasBeforeAnchor = sequence(new YamlAlias("a"), new YamlScalar("x", null, "a", YamlScalarStyle.PLAIN));
         assertThrows(YamlWriteException.class, () -> Yaml.stringify(aliasBeforeAnchor));
@@ -536,7 +540,7 @@ class YamlCoreTest {
 
     @Test
     void usesCommonExceptionBase() {
-        assertInstanceOf(YamlException.class, assertThrows(YamlParseException.class, () -> Yaml.parse("a: !tag 1")));
+        assertInstanceOf(YamlException.class, assertThrows(YamlParseException.class, () -> Yaml.parse("a: !e!tag 1")));
         assertTrue(YamlException.class.isAssignableFrom(YamlWriteException.class));
     }
 

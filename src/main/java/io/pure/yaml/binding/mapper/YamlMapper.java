@@ -1,5 +1,6 @@
 package io.pure.yaml.binding.mapper;
 
+import java.io.InputStream;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
 import java.lang.reflect.GenericArrayType;
@@ -10,6 +11,7 @@ import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -45,6 +47,8 @@ import io.pure.yaml.core.model.YamlNode;
 import io.pure.yaml.core.model.YamlScalar;
 import io.pure.yaml.core.model.YamlScalarStyle;
 import io.pure.yaml.core.model.YamlSequence;
+import io.pure.yaml.core.model.YamlTags;
+import io.pure.yaml.core.parser.YamlEncoding;
 import io.pure.yaml.core.parser.YamlParser;
 
 public final class YamlMapper {
@@ -95,6 +99,13 @@ public final class YamlMapper {
         return Yaml.stringify(toYamlNode(value));
     }
 
+    /**
+     * Writes the value as UTF-8, the encoding recommended for {@code application/yaml} (RFC 9512).
+     */
+    public byte[] writeValueAsBytes(Object value) {
+        return writeValueAsString(value).getBytes(StandardCharsets.UTF_8);
+    }
+
     public YamlNode toYamlNode(Object value) {
         return toYamlNodeInternal(value, new IdentityHashMap<>());
     }
@@ -105,6 +116,29 @@ public final class YamlMapper {
 
     public <T> T readValue(String yaml, YamlTypeRef<T> typeRef) {
         return readValue(parse(yaml), typeRef.getType());
+    }
+
+    /**
+     * Reads YAML bytes in UTF-8, UTF-16 or UTF-32 (detected as described in YAML 1.2.2, 5.2).
+     */
+    public <T> T readValue(byte[] yaml, Class<T> type) {
+        return readValue(new YamlParser(yaml, config.processingLimits()).parse().root(), type);
+    }
+
+    public <T> T readValue(byte[] yaml, YamlTypeRef<T> typeRef) {
+        return readValue(new YamlParser(yaml, config.processingLimits()).parse().root(), typeRef.getType());
+    }
+
+    /**
+     * Reads a YAML stream in UTF-8, UTF-16 or UTF-32; no more bytes are read than the configured
+     * character limit allows. The stream is not closed.
+     */
+    public <T> T readValue(InputStream yaml, Class<T> type) {
+        return readValue(parse(YamlEncoding.read(yaml, config.processingLimits().maxCharacters())), type);
+    }
+
+    public <T> T readValue(InputStream yaml, YamlTypeRef<T> typeRef) {
+        return readValue(parse(YamlEncoding.read(yaml, config.processingLimits().maxCharacters())), typeRef.getType());
     }
 
     public <T> T readValue(YamlNode node, Class<T> type) {
@@ -303,7 +337,8 @@ public final class YamlMapper {
         if (adapter != null) {
             return adapter.fromYaml(node, type, this, path);
         }
-        if (isNullNode(node)) {
+        checkTagKind(node, path);
+        if (isNullNode(node, path)) {
             if (rawClass.isPrimitive()) {
                 throw new YamlMappingException("Cannot assign null to primitive at " + path);
             }
@@ -396,7 +431,7 @@ public final class YamlMapper {
 
         List<YamlEntry> propertyEntries = new ArrayList<>();
         for (YamlEntry entry : mapping.entries()) {
-            String key = scalarKey(entry.key(), path);
+            String key = boundKey(entry.key(), path);
             if (creatorNames.contains(key)) {
                 continue;
             }
@@ -431,10 +466,57 @@ public final class YamlMapper {
             return readCollection(node, List.class, List.class, path, context);
         }
         YamlScalar scalar = (YamlScalar) node;
-        if (scalar.style() != YamlScalarStyle.PLAIN) {
-            return scalar.value();
+        String value = scalarText(scalar);
+        String tag = scalar.tag();
+        if (YamlTags.INT.equals(tag)) {
+            if (!INTEGER.matcher(value).matches() && !HEXADECIMAL.matcher(value).matches() && !OCTAL.matcher(value).matches()) {
+                throw new YamlMappingException("Invalid !!int value at " + path + ": " + abbreviate(value));
+            }
+            return resolvePlainScalar(value, path);
         }
-        return resolvePlainScalar(scalar.value(), path);
+        if (YamlTags.FLOAT.equals(tag)) {
+            checkNumberLength(value, path);
+            return readDouble(value, path);
+        }
+        if (YamlTags.BOOL.equals(tag)) {
+            return parseBoolean(value, path);
+        }
+        if (isTextual(scalar)) {
+            return value;
+        }
+        return resolvePlainScalar(value, path);
+    }
+
+    /**
+     * Whether a scalar is text for the core schema: quoted or block style, or tagged {@code !!str}
+     * or {@code !}. Other tags (local or unknown) are metadata and do not change the resolution.
+     */
+    private static boolean isTextual(YamlScalar scalar) {
+        String tag = scalar.tag();
+        if (YamlTags.STR.equals(tag) || YamlTags.NON_SPECIFIC.equals(tag)) {
+            return true;
+        }
+        if (YamlTags.INT.equals(tag) || YamlTags.FLOAT.equals(tag) || YamlTags.BOOL.equals(tag) || YamlTags.NULL.equals(tag)) {
+            return false;
+        }
+        return scalar.style() != YamlScalarStyle.PLAIN;
+    }
+
+    /**
+     * Rejects core schema tags on nodes of the wrong kind, such as {@code !!map} on a sequence.
+     */
+    private static void checkTagKind(YamlNode node, String path) {
+        String tag = node.tag();
+        if (tag == null) {
+            return;
+        }
+        boolean scalarTag = YamlTags.STR.equals(tag) || YamlTags.INT.equals(tag) || YamlTags.FLOAT.equals(tag)
+            || YamlTags.BOOL.equals(tag) || YamlTags.NULL.equals(tag);
+        if (scalarTag && !(node instanceof YamlScalar)
+            || YamlTags.SEQ.equals(tag) && !(node instanceof YamlSequence)
+            || YamlTags.MAP.equals(tag) && !(node instanceof YamlMapping)) {
+            throw new YamlMappingException("Tag " + tag + " does not match the node at " + path);
+        }
     }
 
     /**
@@ -506,7 +588,7 @@ public final class YamlMapper {
         }
         Map<Object, Object> result = instantiateMap(rawClass, keyClass);
         for (YamlEntry entry : mapping.entries()) {
-            String keyText = scalarKey(entry.key(), path);
+            String keyText = boundKey(entry.key(), path);
             String entryPath = path + "." + keyText;
             Object key = textKeys ? keyText : readValueInternal(entry.key(), keyType, entryPath, context);
             if (key == null) {
@@ -777,7 +859,14 @@ public final class YamlMapper {
         if (!(node instanceof YamlScalar scalar)) {
             throw new YamlMappingException("Expected scalar at " + path);
         }
-        return scalar.value();
+        return scalarText(scalar);
+    }
+
+    /**
+     * The text of a scalar; an empty node that is not null (for example tagged {@code !!str}) is "".
+     */
+    private static String scalarText(YamlScalar scalar) {
+        return scalar.value() == null ? "" : scalar.value();
     }
 
     /**
@@ -785,8 +874,8 @@ public final class YamlMapper {
      */
     private String expectTypedScalarValue(YamlNode node, String path) {
         String value = expectScalarValue(node, path);
-        if (!config.coerceQuotedScalars() && ((YamlScalar) node).style() != YamlScalarStyle.PLAIN) {
-            throw new YamlMappingException("Expected an unquoted scalar at " + path + ", got quoted: " + abbreviate(value));
+        if (!config.coerceQuotedScalars() && isTextual((YamlScalar) node)) {
+            throw new YamlMappingException("Expected an unquoted scalar at " + path + ", got text: " + abbreviate(value));
         }
         return value;
     }
@@ -802,17 +891,28 @@ public final class YamlMapper {
     /**
      * Only plain scalars can be null; quoted {@code "null"} and {@code "~"} are strings.
      */
-    private static boolean isNullNode(YamlNode node) {
+    /**
+     * Null for the core schema: an empty node or a plain null lexeme, unless a tag says otherwise;
+     * a {@code !!null} tag requires one of those forms.
+     */
+    private static boolean isNullNode(YamlNode node, String path) {
         if (!(node instanceof YamlScalar scalar)) {
             return false;
         }
-        if (scalar.value() == null) {
-            return true;
-        }
-        return scalar.style() == YamlScalarStyle.PLAIN && switch (scalar.value()) {
+        boolean nullForm = scalar.value() == null || switch (scalar.value()) {
             case "null", "Null", "NULL", "~" -> true;
             default -> false;
         };
+        if (YamlTags.NULL.equals(scalar.tag())) {
+            if (!nullForm && !scalar.value().isEmpty()) {
+                throw new YamlMappingException("Invalid !!null value at " + path + ": " + abbreviate(scalar.value()));
+            }
+            return true;
+        }
+        if (isTextual(scalar) || scalar.tag() != null && scalar.tag().startsWith(YamlTags.CORE_PREFIX)) {
+            return false;
+        }
+        return scalar.value() == null || scalar.style() == YamlScalarStyle.PLAIN && nullForm;
     }
 
     private String scalarKey(YamlNode key, String path) {
@@ -826,6 +926,17 @@ public final class YamlMapper {
             throw new YamlMappingException("Only scalar keys are supported at " + path);
         }
         return scalar.value();
+    }
+
+    /**
+     * The key of a mapping entry bound to a Java map or property; empty keys cannot be bound.
+     */
+    private String boundKey(YamlNode key, String path) {
+        String text = scalarKey(key, path);
+        if (text == null) {
+            throw new YamlMappingException("Empty mapping key cannot be bound at " + path);
+        }
+        return text;
     }
 
     private static YamlMappingException aliasResolutionDisabled(YamlAlias alias, String path) {

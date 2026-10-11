@@ -5,76 +5,19 @@
 #
 # Suite: https://github.com/yaml/yaml-test-suite, branch "data",
 # commit 6ad3d2c62885d82fc349026c136ef560838fdf3d
-2AUY      # Tags are not supported
-2JQS      # Empty mapping keys are not supported
-2XXW      # Tags are not supported
-33X3      # Tags are not supported
-35KP      # Tags are not supported
+2JQS      # Duplicate mapping key 'null'
 4FJ6      # Only scalar mapping keys are supported
-52DL      # Tags are not supported
-565N      # Tags are not supported
-57H4      # Tags are not supported
-5TYM      # %TAG directives are not supported
-5WE3      # Complex mapping keys are not supported
 6BFJ      # Only scalar mapping keys are supported
-6CK3      # %TAG directives are not supported
-6JWB      # Tags are not supported
-6M2F      # Complex mapping keys are not supported
-6PBE      # Complex mapping keys are not supported
-6WLZ      # Tags are not supported
-735Y      # Tags are not supported
-74H7      # Tags are not supported
-7FWL      # Tags are not supported
-7W2P      # Complex mapping keys are not supported
-8MK2      # Tags are not supported
-9KAX      # Tags are not supported
+6PBE      # Only scalar mapping keys are supported
 9MMW      # Only scalar mapping keys are supported
-9WXW      # Tags are not supported
-A2M4      # Complex mapping keys are not supported
-BU8L      # Tags are not supported
-C4HZ      # %TAG directives are not supported
-CC74      # %TAG directives are not supported
-CFD4      # Empty mapping keys are not supported
-CT4Q      # Complex mapping keys are not supported
-CUP7      # Tags are not supported
-DFF7      # Complex mapping keys are not supported
-EHF6      # Tags are not supported
-F2C7      # Tags are not supported
-FH7J      # Tags are not supported
-FRK4      # Complex mapping keys are not supported
-GH63      # Complex mapping keys are not supported
-HMQ5      # Tags are not supported
-J7PZ      # Tags are not supported
-JTV5      # Complex mapping keys are not supported
-KK5P      # Complex mapping keys are not supported
-L94M      # Complex mapping keys are not supported
-LE5A      # Tags are not supported
+KK5P      # Only scalar mapping keys are supported
 LX3P      # Only scalar mapping keys are supported
-M2N8/00   # Complex mapping keys are not supported
-M2N8/01   # Complex mapping keys are not supported
-M5C3      # Tags are not supported
-M5DY      # Complex mapping keys are not supported
-NHX8      # Empty mapping keys are not supported
-NKF9      # Empty mapping keys are not supported
-P76L      # %TAG directives are not supported
-PW8X      # Empty mapping keys are not supported
+M2N8/00   # Only scalar mapping keys are supported
+M2N8/01   # Only scalar mapping keys are supported
+M5DY      # Only scalar mapping keys are supported
 Q9WF      # Only scalar mapping keys are supported
-RR7F      # Complex mapping keys are not supported
-RZP5      # Complex mapping keys are not supported
-S3PD      # Empty mapping keys are not supported
-S4JQ      # Tags are not supported
-S9E8      # Complex mapping keys are not supported
+RZP5      # Only scalar mapping keys are supported
 SBG9      # Only scalar mapping keys are supported
-SM9W/01   # Empty mapping keys are not supported
-U3C3      # %TAG directives are not supported
-UGM3      # Tags are not supported
-UKK6/00   # Empty mapping keys are not supported
-UKK6/02   # Tags are not supported
-V9D5      # Complex mapping keys are not supported
-WZ62      # Tags are not supported
+V9D5      # Only scalar mapping keys are supported
 X38W      # Only scalar mapping keys are supported
-X8DW      # Complex mapping keys are not supported
-XW4D      # Complex mapping keys are not supported
-Z67P      # Tags are not supported
-Z9M4      # %TAG directives are not supported
-ZWK4      # Complex mapping keys are not supported
+XW4D      # Only scalar mapping keys are supported

@@ -1,8 +1,14 @@
 package io.pure.yaml.core.parser;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,6 +23,7 @@ import io.pure.yaml.core.model.YamlScalar;
 import io.pure.yaml.core.model.YamlScalarStyle;
 import io.pure.yaml.core.model.YamlSequence;
 import io.pure.yaml.core.model.YamlStream;
+import io.pure.yaml.core.model.YamlTags;
 
 /**
  * Parses one YAML text. An instance may be used for several {@code parse}/{@code parseStream} calls,
@@ -33,6 +40,7 @@ public final class YamlParser {
     private int aliasCount;
     private Map<String, YamlNode> anchors;
     private Set<YamlNode> openNodes;
+    private Map<String, String> tagHandles;
 
     public YamlParser(String text, YamlProcessingLimits limits) {
         Objects.requireNonNull(text, "text");
@@ -45,13 +53,29 @@ public final class YamlParser {
     }
 
     /**
+     * Parses YAML bytes in UTF-8, UTF-16 or UTF-32, detected as described in YAML 1.2.2, 5.2.
+     */
+    public YamlParser(byte[] bytes, YamlProcessingLimits limits) {
+        this(decodeWithinLimits(bytes, limits), limits);
+    }
+
+    private static String decodeWithinLimits(byte[] bytes, YamlProcessingLimits limits) {
+        Objects.requireNonNull(bytes, "bytes");
+        Objects.requireNonNull(limits, "limits");
+        if (bytes.length > YamlEncoding.maxBytes(limits.maxCharacters())) {
+            throw new YamlParseException("YAML input exceeds configured size limit");
+        }
+        return YamlEncoding.decode(bytes);
+    }
+
+    /**
      * Parses a stream that contains at most one document; a stream without documents
      * (empty, or only comments) yields a document whose root is an empty node.
      */
     public YamlDocument parse() {
         reset();
         if (!skipToDocument()) {
-            return new YamlDocument(emptyNode(null));
+            return new YamlDocument(emptyNode(NodeProperties.NONE));
         }
         YamlDocument document = parseDocument();
         if (skipToDocument()) {
@@ -110,6 +134,10 @@ public final class YamlParser {
         // Anchors are scoped to a document (YAML 1.2.2, 9.2; RFC 9512, 3.2).
         anchors = new HashMap<>();
         openNodes = Collections.newSetFromMap(new IdentityHashMap<>());
+        // Tag handles are declared per document; "!" and "!!" have default prefixes (YAML 1.2.2, 6.8.2).
+        tagHandles = new HashMap<>();
+        tagHandles.put("!", "!");
+        tagHandles.put("!!", YamlTags.CORE_PREFIX);
         String versionDirective = parseDirectives();
         skipIgnorable();
         YamlNode root;
@@ -118,7 +146,7 @@ public final class YamlParser {
         } else if (versionDirective != null) {
             throw new YamlParseException("Directives must be followed by a document start marker '---'");
         } else {
-            root = parseBlockValue(-1, 0, false, null);
+            root = parseBlockValue(-1, 0, false, NodeProperties.NONE);
         }
         skipIgnorable();
         if (index < lines.size()) {
@@ -142,19 +170,20 @@ public final class YamlParser {
         String rest = content.substring(offset);
         if (rest.isEmpty() || rest.startsWith("#")) {
             index++;
-            return parseBlockValue(-1, 0, false, null);
+            return parseBlockValue(-1, 0, false, NodeProperties.NONE);
         }
         // "--- value": the root node starts on the marker line; block collections cannot start there.
-        if (isSequenceEntry(rest) || findKeySeparator(rest) >= 0) {
+        if (isSequenceEntry(rest) || isIndicatorWithBlank(rest, '?') || findKeySeparator(rest) >= 0) {
             throw new YamlParseException("Block collections cannot start on the document start line at line " + marker.lineNumber());
         }
         Line root = new Line(marker.lineNumber(), offset, rest, false, false, marker.trailing(), marker.raw());
         lines.set(index, root);
-        return parseNodeAt(root, -1, 0, null, false);
+        return parseNodeAt(root, -1, 0, NodeProperties.NONE, false);
     }
 
     private String parseDirectives() {
         String versionDirective = null;
+        Set<String> declaredHandles = new HashSet<>();
         while (true) {
             skipIgnorable();
             if (index >= lines.size()) {
@@ -175,7 +204,7 @@ public final class YamlParser {
                 }
                 versionDirective = directive;
             } else if (parts[0].equals("%TAG")) {
-                throw new YamlParseException("%TAG directives are not supported at line " + line.lineNumber());
+                declareTagHandle(parts, declaredHandles, line.lineNumber());
             }
             // Other directives are reserved by the YAML spec and ignored.
             index++;
@@ -183,26 +212,47 @@ public final class YamlParser {
     }
 
     /**
+     * Declares a tag handle: {@code %TAG !e! tag:example.com,2000:} (YAML 1.2.2, 6.8.2).
+     */
+    private void declareTagHandle(String[] parts, Set<String> declaredHandles, int lineNumber) {
+        if (parts.length != 3) {
+            throw new YamlParseException("Invalid %TAG directive at line " + lineNumber);
+        }
+        String handle = parts[1];
+        String prefix = parts[2];
+        if (!handle.matches("!([0-9A-Za-z-]*!)?")) {
+            throw new YamlParseException("Invalid tag handle '" + handle + "' at line " + lineNumber);
+        }
+        if (prefix.charAt(0) != '!' && FLOW_INDICATORS.indexOf(prefix.charAt(0)) >= 0) {
+            throw new YamlParseException("Invalid tag prefix '" + prefix + "' at line " + lineNumber);
+        }
+        if (!declaredHandles.add(handle)) {
+            throw new YamlParseException("Duplicate %TAG directive for handle '" + handle + "' at line " + lineNumber);
+        }
+        tagHandles.put(handle, prefix);
+    }
+
+    /**
      * Parses a node that starts on a following line, or returns an empty node.
      *
-     * @param anchor anchor given on a preceding line, or {@code null}
+     * @param properties properties given on a preceding line
      */
-    private YamlNode parseBlockValue(int parentIndent, int depth, boolean allowCompactSequence, String anchor) {
+    private YamlNode parseBlockValue(int parentIndent, int depth, boolean allowCompactSequence, NodeProperties properties) {
         skipIgnorable();
         if (index >= lines.size()) {
-            return emptyNode(anchor);
+            return emptyNode(properties);
         }
         Line line = current();
         if (isDocumentMarker(line)) {
-            return emptyNode(anchor);
+            return emptyNode(properties);
         }
         if (line.indent() > parentIndent) {
-            return parseNodeAt(line, parentIndent, depth, anchor, allowCompactSequence);
+            return parseNodeAt(line, parentIndent, depth, properties, allowCompactSequence);
         }
         if (allowCompactSequence && line.indent() == parentIndent && isSequenceEntry(line.content())) {
-            return parseSequence(parentIndent, depth + 1, anchor);
+            return parseSequence(parentIndent, depth + 1, properties);
         }
-        return emptyNode(anchor);
+        return emptyNode(properties);
     }
 
     /**
@@ -213,28 +263,28 @@ public final class YamlParser {
      * @param allowCompactSequence whether a node given only by properties on this line may be a
      *                             sequence at {@code parentIndent} (the value of a block mapping)
      */
-    private YamlNode parseNodeAt(Line line, int parentIndent, int depth, String anchor, boolean allowCompactSequence) {
+    private YamlNode parseNodeAt(Line line, int parentIndent, int depth, NodeProperties properties, boolean allowCompactSequence) {
         String content = line.content();
         boolean sequence = isSequenceEntry(content);
-        boolean mapping = !sequence && findKeySeparator(content) >= 0;
+        boolean mapping = !sequence && (isIndicatorWithBlank(content, '?') || findKeySeparator(content) >= 0);
         if ((sequence || mapping) && line.leadingTab()) {
             throw tabIndentation(line);
         }
         if (sequence) {
-            return parseSequence(line.indent(), depth + 1, anchor);
+            return parseSequence(line.indent(), depth + 1, properties);
         }
         if (mapping) {
-            return parseMapping(line.indent(), depth + 1, anchor);
+            return parseMapping(line.indent(), depth + 1, properties);
         }
         index++;
         Context context = allowCompactSequence ? Context.VALUE : Context.NODE;
-        return parseInlineValue(content, line.trailing(), line.lineNumber(), parentIndent, depth, context, anchor);
+        return parseInlineValue(content, line.trailing(), line.lineNumber(), parentIndent, depth, context, properties);
     }
 
-    private YamlSequence parseSequence(int indent, int depth, String anchor) {
+    private YamlSequence parseSequence(int indent, int depth, NodeProperties properties) {
         ensureDepth(depth);
-        YamlSequence sequence = new YamlSequence(null, anchor);
-        open(anchor, sequence);
+        YamlSequence sequence = new YamlSequence(properties.tag(), properties.anchor());
+        open(properties, sequence);
         try {
             while (true) {
                 skipIgnorable();
@@ -251,37 +301,43 @@ public final class YamlParser {
                 if (line.leadingTab()) {
                     throw tabIndentation(line);
                 }
-                String content = line.content();
-                if (!isSequenceEntry(content)) {
+                if (!isSequenceEntry(line.content())) {
                     return sequence;
                 }
-                int offset = 1;
-                boolean tabSeparated = false;
-                while (offset < content.length() && isBlank(content.charAt(offset))) {
-                    tabSeparated |= content.charAt(offset) == '\t';
-                    offset++;
-                }
-                String rest = content.substring(offset);
-                if (rest.isEmpty() || rest.startsWith("#")) {
-                    index++;
-                    sequence.add(parseBlockValue(indent, depth, false, null));
-                } else {
-                    // Re-read the entry content as if it started its own line at the column after "- ".
-                    // A tab in the separator cannot serve as indentation of a nested block collection.
-                    Line item = new Line(line.lineNumber(), indent + offset, rest, tabSeparated, false, line.trailing(), line.raw());
-                    lines.set(index, item);
-                    sequence.add(parseNodeAt(item, indent, depth, null, false));
-                }
+                sequence.add(parseIndicatedNode(line, indent, depth, false));
             }
         } finally {
             close(sequence);
         }
     }
 
-    private YamlMapping parseMapping(int indent, int depth, String anchor) {
+    /**
+     * Parses the node after a "-", "?" or ":" indicator at the start of {@code line}: either on the
+     * rest of the line, re-read as if it started its own line at that column, or on the following lines.
+     */
+    private YamlNode parseIndicatedNode(Line line, int indent, int depth, boolean allowCompactSequence) {
+        String content = line.content();
+        int offset = 1;
+        boolean tabSeparated = false;
+        while (offset < content.length() && isBlank(content.charAt(offset))) {
+            tabSeparated |= content.charAt(offset) == '\t';
+            offset++;
+        }
+        String rest = content.substring(offset);
+        if (rest.isEmpty() || rest.startsWith("#")) {
+            index++;
+            return parseBlockValue(indent, depth, allowCompactSequence, NodeProperties.NONE);
+        }
+        // A tab in the separator cannot serve as indentation of a nested block collection.
+        Line item = new Line(line.lineNumber(), indent + offset, rest, tabSeparated, false, line.trailing(), line.raw());
+        lines.set(index, item);
+        return parseNodeAt(item, indent, depth, NodeProperties.NONE, false);
+    }
+
+    private YamlMapping parseMapping(int indent, int depth, NodeProperties properties) {
         ensureDepth(depth);
-        YamlMapping mapping = new YamlMapping(null, anchor);
-        open(anchor, mapping);
+        YamlMapping mapping = new YamlMapping(properties.tag(), properties.anchor());
+        open(properties, mapping);
         try {
             while (true) {
                 skipIgnorable();
@@ -303,7 +359,19 @@ public final class YamlParser {
                     throw new YamlParseException("Sequence entry is not allowed inside a mapping at line " + line.lineNumber());
                 }
                 if (isIndicatorWithBlank(content, '?')) {
-                    throw new YamlParseException("Complex mapping keys are not supported at line " + line.lineNumber());
+                    // Explicit entry (YAML 1.2.2, 8.2.2): "? key" and an optional ": value" at the same indentation.
+                    YamlNode key = checkScalarKey(parseIndicatedNode(line, indent, depth, true), line.lineNumber());
+                    ensureUniqueKey(mapping, key, line.lineNumber());
+                    skipIgnorable();
+                    YamlNode value = emptyNode(NodeProperties.NONE);
+                    if (index < lines.size()) {
+                        Line valueLine = current();
+                        if (valueLine.indent() == indent && !valueLine.leadingTab() && isIndicatorWithBlank(valueLine.content(), ':')) {
+                            value = parseIndicatedNode(valueLine, indent, depth, true);
+                        }
+                    }
+                    mapping.put(key, value);
+                    continue;
                 }
                 int separator = findKeySeparator(content);
                 if (separator < 0) {
@@ -312,13 +380,11 @@ public final class YamlParser {
                 index++;
                 ensureImplicitKeyLength(content, 0, separator, line.lineNumber());
                 YamlNode key = parseKey(content.substring(0, separator), line.lineNumber(), depth);
-                if (mapping.containsKey(keyText(key))) {
-                    throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + line.lineNumber());
-                }
+                ensureUniqueKey(mapping, key, line.lineNumber());
                 String rawValue = trim(content.substring(separator + 1));
                 YamlNode value = rawValue.isEmpty() || rawValue.startsWith("#")
-                    ? parseBlockValue(indent, depth, true, null)
-                    : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, depth, Context.VALUE, null);
+                    ? parseBlockValue(indent, depth, true, NodeProperties.NONE)
+                    : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, depth, Context.VALUE, NodeProperties.NONE);
                 mapping.put(key, value);
             }
         } finally {
@@ -329,12 +395,16 @@ public final class YamlParser {
     private YamlNode parseKey(String rawKey, int lineNumber, int depth) {
         String key = trim(rawKey);
         if (key.isEmpty()) {
-            throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
+            // An empty implicit key (": value", YAML 1.2.2, 8.2.1).
+            return emptyNode(NodeProperties.NONE);
         }
-        if (isIndicatorWithBlank(key, '?')) {
-            throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
+        return checkScalarKey(parseInlineValue(key, "", lineNumber, -1, depth, Context.KEY, NodeProperties.NONE), lineNumber);
+    }
+
+    private static void ensureUniqueKey(YamlMapping mapping, YamlNode key, int lineNumber) {
+        if (mapping.containsKey(keyText(key))) {
+            throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + lineNumber);
         }
-        return checkScalarKey(parseInlineValue(key, "", lineNumber, -1, depth, Context.KEY, null), lineNumber);
     }
 
     /**
@@ -342,7 +412,7 @@ public final class YamlParser {
      * multi-line nodes continue on the following lines, which must be indented further than
      * {@code parentIndent}. Implicit keys are always single-line.
      *
-     * @param outerAnchor anchor given on a preceding line, or {@code null}
+     * @param outer properties given on a preceding line
      */
     private YamlNode parseInlineValue(
         String raw,
@@ -351,31 +421,29 @@ public final class YamlParser {
         int parentIndent,
         int depth,
         Context context,
-        String outerAnchor
+        NodeProperties outer
     ) {
-        Properties properties = readProperties(raw, 0, lineNumber, false);
-        if (properties.anchor() != null && outerAnchor != null) {
-            throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
-        }
-        String anchor = properties.anchor() != null ? properties.anchor() : outerAnchor;
-        String text = raw.substring(properties.end());
+        PropertyScan scan = readProperties(raw, 0, lineNumber, false);
+        NodeProperties properties = outer.combine(scan.properties(), lineNumber);
+        String text = raw.substring(scan.end());
         if (text.isEmpty() || text.startsWith("#")) {
             if (context == Context.KEY) {
-                throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
+                // Properties of an empty key, as in "&anchor : value".
+                return emptyNode(properties);
             }
             // Only properties on this line: the node itself starts on the next line.
-            return parseBlockValue(parentIndent, depth, context == Context.VALUE, anchor);
+            return parseBlockValue(parentIndent, depth, context == Context.VALUE, properties);
         }
         char first = text.charAt(0);
         switch (first) {
             case '"', '\'' -> {
                 Quoted quoted = readQuoted(text + trailing, 0, lineNumber, parentIndent, context != Context.KEY);
                 ensureOnlyComment(quoted.lineText().substring(quoted.end()), quoted.lineNumber());
-                return register(new YamlScalar(quoted.value(), null, anchor, quoted.style()));
+                return register(new YamlScalar(quoted.value(), properties.tag(), properties.anchor(), quoted.style()));
             }
             case '*' -> {
-                if (anchor != null) {
-                    throw new YamlParseException("An alias cannot have an anchor at line " + lineNumber);
+                if (!properties.isEmpty()) {
+                    throw new YamlParseException("An alias cannot have properties at line " + lineNumber);
                 }
                 return parseAlias(stripComment(text), lineNumber);
             }
@@ -384,7 +452,7 @@ public final class YamlParser {
                     throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
                 }
                 FlowParser flow = new FlowParser(text + trailing, lineNumber, parentIndent);
-                YamlNode node = flow.parseCollection(depth, anchor);
+                YamlNode node = flow.parseCollection(depth, properties);
                 ensureOnlyComment(flow.remainder(), flow.lineNumber());
                 return node;
             }
@@ -392,7 +460,7 @@ public final class YamlParser {
                 if (context == Context.KEY) {
                     throw new YamlParseException("Block scalars cannot be mapping keys at line " + lineNumber);
                 }
-                return parseBlockScalar(text, lineNumber, parentIndent, anchor);
+                return parseBlockScalar(text, lineNumber, parentIndent, properties);
             }
             case ']', '}', ',', '%', '@', '`' ->
                 throw new YamlParseException("Plain scalar cannot start with '" + first + "' at line " + lineNumber);
@@ -405,17 +473,17 @@ public final class YamlParser {
             throw new YamlParseException("Sequence entry is not allowed on a mapping value line at line " + lineNumber);
         }
         if (isIndicatorWithBlank(plain, '?')) {
-            throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
+            throw new YamlParseException("Explicit mapping keys are not allowed here at line " + lineNumber);
         }
         if (context == Context.KEY) {
-            return register(new YamlScalar(plain, null, anchor, YamlScalarStyle.PLAIN));
+            return register(new YamlScalar(plain, properties.tag(), properties.anchor(), YamlScalarStyle.PLAIN));
         }
         if (hasMappingIndicator(plain)) {
             throw new YamlParseException("Mapping values are not allowed here at line " + lineNumber + ", quote the value");
         }
         // A comment ends a plain scalar, so it cannot continue on the next line.
         String value = commentStart < 0 ? readPlainContinuation(plain, parentIndent) : plain;
-        return register(new YamlScalar(value, null, anchor, YamlScalarStyle.PLAIN));
+        return register(new YamlScalar(value, properties.tag(), properties.anchor(), YamlScalarStyle.PLAIN));
     }
 
     /**
@@ -535,7 +603,7 @@ public final class YamlParser {
     /**
      * Reads a literal ({@code |}) or folded ({@code >}) block scalar (YAML 1.2.2, 8.1).
      */
-    private YamlScalar parseBlockScalar(String header, int lineNumber, int parentIndent, String anchor) {
+    private YamlScalar parseBlockScalar(String header, int lineNumber, int parentIndent, NodeProperties properties) {
         boolean literal = header.charAt(0) == '|';
         int indentation = 0;
         char chomping = 0;
@@ -612,7 +680,7 @@ public final class YamlParser {
             default -> body + lastBreak;
         };
         YamlScalarStyle style = literal ? YamlScalarStyle.LITERAL : YamlScalarStyle.FOLDED;
-        return register(new YamlScalar(value, null, anchor, style));
+        return register(new YamlScalar(value, properties.tag(), properties.anchor(), style));
     }
 
     private static void ensureNotTabIndented(String raw, int lineNumber) {
@@ -696,38 +764,129 @@ public final class YamlParser {
     }
 
     /**
-     * Reads node properties at the start of {@code text}: an anchor ({@code &name}); tags are not supported.
+     * Reads node properties at {@code from}: an anchor ({@code &name}) and a tag, in either order
+     * (YAML 1.2.2, 6.9).
      */
-    private static Properties readProperties(String text, int from, int lineNumber, boolean flow) {
+    private PropertyScan readProperties(String text, int from, int lineNumber, boolean flow) {
         String anchor = null;
+        String tag = null;
         int position = from;
         while (position < text.length()) {
             char ch = text.charAt(position);
-            if (ch == '!') {
-                throw new YamlParseException("Tags are not supported at line " + lineNumber);
-            }
-            if (ch != '&') {
+            int start = position;
+            if (ch == '&') {
+                if (anchor != null) {
+                    throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
+                }
+                position++;
+                while (position < text.length() && isAnchorChar(text.charAt(position))) {
+                    position++;
+                }
+                anchor = text.substring(start + 1, position);
+                if (anchor.isEmpty()) {
+                    throw new YamlParseException("Anchor name expected at line " + lineNumber);
+                }
+            } else if (ch == '!') {
+                if (tag != null) {
+                    throw new YamlParseException("A node cannot have two tags at line " + lineNumber);
+                }
+                position = scanTag(text, position, lineNumber);
+                tag = resolveTag(text.substring(start, position), lineNumber);
+            } else {
                 break;
             }
-            if (anchor != null) {
-                throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
-            }
-            int start = ++position;
-            while (position < text.length() && isAnchorChar(text.charAt(position))) {
-                position++;
-            }
-            anchor = text.substring(start, position);
-            if (anchor.isEmpty()) {
-                throw new YamlParseException("Anchor name expected at line " + lineNumber);
-            }
-            if (position < text.length() && !isBlank(text.charAt(position)) && !flow) {
-                throw new YamlParseException("Anchor must be followed by white space at line " + lineNumber);
+            if (position < text.length() && !isBlank(text.charAt(position))
+                && !(flow && FLOW_INDICATORS.indexOf(text.charAt(position)) >= 0)) {
+                throw new YamlParseException("Node properties must be followed by white space at line " + lineNumber);
             }
             while (position < text.length() && isBlank(text.charAt(position))) {
                 position++;
             }
         }
-        return new Properties(anchor, position);
+        return new PropertyScan(new NodeProperties(anchor, tag), position);
+    }
+
+    private static int scanTag(String text, int start, int lineNumber) {
+        if (text.startsWith("!<", start)) {
+            int close = text.indexOf('>', start);
+            if (close < 0) {
+                throw new YamlParseException("Unterminated verbatim tag at line " + lineNumber);
+            }
+            return close + 1;
+        }
+        int position = start + 1;
+        while (position < text.length() && isAnchorChar(text.charAt(position))) {
+            position++;
+        }
+        return position;
+    }
+
+    /**
+     * Resolves a tag property to a tag: verbatim {@code !<tag>}, the non-specific {@code !}, or a
+     * shorthand whose handle ({@code !}, {@code !!} or {@code !name!}) maps to a prefix (YAML 1.2.2, 6.9.1).
+     */
+    private String resolveTag(String token, int lineNumber) {
+        if (token.startsWith("!<")) {
+            String tag = token.substring(2, token.length() - 1);
+            if (tag.isEmpty() || tag.equals("!") || tag.chars().anyMatch(ch -> isBlank((char) ch))) {
+                throw new YamlParseException("Invalid verbatim tag '" + token + "' at line " + lineNumber);
+            }
+            return tag;
+        }
+        if (token.equals("!")) {
+            return YamlTags.NON_SPECIFIC;
+        }
+        int handleEnd = 1;
+        while (handleEnd < token.length() && isHandleChar(token.charAt(handleEnd))) {
+            handleEnd++;
+        }
+        String handle = handleEnd < token.length() && token.charAt(handleEnd) == '!' ? token.substring(0, handleEnd + 1) : "!";
+        String suffix = token.substring(handle.length());
+        String prefix = tagHandles.get(handle);
+        if (prefix == null) {
+            throw new YamlParseException("Undefined tag handle '" + handle + "' at line " + lineNumber);
+        }
+        if (suffix.isEmpty() || suffix.indexOf('!') >= 0) {
+            throw new YamlParseException("Invalid tag '" + token + "' at line " + lineNumber);
+        }
+        return prefix + percentDecode(suffix, lineNumber);
+    }
+
+    private static boolean isHandleChar(char ch) {
+        return ch >= '0' && ch <= '9' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch == '-';
+    }
+
+    /**
+     * Decodes URI escapes in a tag suffix, such as {@code %21} for {@code !}.
+     */
+    private static String percentDecode(String suffix, int lineNumber) {
+        if (suffix.indexOf('%') < 0) {
+            return suffix;
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        for (int i = 0; i < suffix.length(); ) {
+            int codePoint = suffix.codePointAt(i);
+            if (codePoint == '%') {
+                if (i + 2 >= suffix.length() || Character.digit(suffix.charAt(i + 1), 16) < 0
+                    || Character.digit(suffix.charAt(i + 2), 16) < 0) {
+                    throw new YamlParseException("Invalid escape in tag at line " + lineNumber + ": " + suffix);
+                }
+                bytes.write(Integer.parseInt(suffix.substring(i + 1, i + 3), 16));
+                i += 3;
+            } else {
+                bytes.writeBytes(Character.toString(codePoint).getBytes(StandardCharsets.UTF_8));
+                i += Character.charCount(codePoint);
+            }
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes.toByteArray()))
+                .toString();
+        } catch (CharacterCodingException exception) {
+            throw new YamlParseException("Invalid escape in tag at line " + lineNumber + ": " + suffix);
+        }
     }
 
     private YamlAlias parseAlias(String text, int lineNumber) {
@@ -763,9 +922,13 @@ public final class YamlParser {
         }
     }
 
+    /**
+     * Keys must be scalars (an empty key is an empty scalar) or aliases of scalars; collection keys
+     * are not supported.
+     */
     private static YamlNode checkScalarKey(YamlNode key, int lineNumber) {
         YamlNode scalar = key instanceof YamlAlias alias ? alias.target() : key;
-        if (!(scalar instanceof YamlScalar value) || value.value() == null) {
+        if (!(scalar instanceof YamlScalar)) {
             throw new YamlParseException("Only scalar mapping keys are supported at line " + lineNumber);
         }
         return key;
@@ -776,9 +939,9 @@ public final class YamlParser {
         return ((YamlScalar) scalar).value();
     }
 
-    private void open(String anchor, YamlNode node) {
-        if (anchor != null) {
-            anchors.put(anchor, node);
+    private void open(NodeProperties properties, YamlNode node) {
+        if (properties.anchor() != null) {
+            anchors.put(properties.anchor(), node);
             openNodes.add(node);
         }
     }
@@ -794,8 +957,8 @@ public final class YamlParser {
         return node;
     }
 
-    private YamlScalar emptyNode(String anchor) {
-        return register(new YamlScalar(null, null, anchor, YamlScalarStyle.PLAIN));
+    private YamlScalar emptyNode(NodeProperties properties) {
+        return register(new YamlScalar(null, properties.tag(), properties.anchor(), YamlScalarStyle.PLAIN));
     }
 
     private String unescape(String body, int lineNumber) {
@@ -1177,14 +1340,14 @@ public final class YamlParser {
             return lineNumber;
         }
 
-        YamlNode parseCollection(int depth, String anchor) {
-            return text.charAt(position) == '[' ? parseFlowSequence(depth + 1, anchor) : parseFlowMapping(depth + 1, anchor);
+        YamlNode parseCollection(int depth, NodeProperties properties) {
+            return text.charAt(position) == '[' ? parseFlowSequence(depth + 1, properties) : parseFlowMapping(depth + 1, properties);
         }
 
-        private YamlSequence parseFlowSequence(int depth, String anchor) {
+        private YamlSequence parseFlowSequence(int depth, NodeProperties properties) {
             ensureDepth(depth);
-            YamlSequence sequence = new YamlSequence(null, anchor);
-            open(anchor, sequence);
+            YamlSequence sequence = new YamlSequence(properties.tag(), properties.anchor());
+            open(properties, sequence);
             try {
                 position++;
                 while (true) {
@@ -1193,31 +1356,28 @@ public final class YamlParser {
                         position++;
                         return sequence;
                     }
+                    YamlNode entry;
                     if (isIndicator('?')) {
-                        throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
-                    }
-                    if (isValueIndicator()) {
-                        throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
-                    }
-                    int entryLine = lineNumber;
-                    int entryStart = position;
-                    YamlNode entry = parseFlowNode(depth);
-                    boolean crossedLine = skipSeparation();
-                    if (isPairSeparator(entry)) {
-                        // A single-pair mapping such as [key: value]; its key must be on one line.
-                        if (crossedLine || lineNumber != entryLine) {
-                            throw new YamlParseException("Implicit keys must be on a single line at line " + lineNumber);
-                        }
-                        ensureImplicitKeyLength(text, entryStart, position, lineNumber);
+                        // An explicit single pair: [? key : value]; it may span lines.
                         position++;
-                        ensureDepth(depth + 1);
-                        YamlMapping pair = new YamlMapping();
-                        YamlNode key = checkScalarKey(entry, lineNumber);
-                        skipSeparation();
-                        YamlNode value = peek() == ',' || peek() == ']' ? emptyNode(null) : parseFlowNode(depth + 1);
-                        pair.put(key, value);
-                        entry = pair;
-                        skipSeparation();
+                        YamlNode key = readExplicitKey(']', depth + 1);
+                        entry = readPair(key, ']', depth + 1);
+                    } else if (isValueIndicator()) {
+                        // A single pair with an empty key: [: value].
+                        entry = readPair(emptyNode(NodeProperties.NONE), ']', depth + 1);
+                    } else {
+                        int entryLine = lineNumber;
+                        int entryStart = position;
+                        entry = parseFlowNode(depth);
+                        boolean crossedLine = skipSeparation();
+                        if (isPairSeparator(entry)) {
+                            // A single-pair mapping such as [key: value]; its key must be on one line.
+                            if (crossedLine || lineNumber != entryLine) {
+                                throw new YamlParseException("Implicit keys must be on a single line at line " + lineNumber);
+                            }
+                            ensureImplicitKeyLength(text, entryStart, position, lineNumber);
+                            entry = readPair(entry, ']', depth + 1);
+                        }
                     }
                     sequence.add(entry);
                     if (!nextEntry(']')) {
@@ -1229,10 +1389,47 @@ public final class YamlParser {
             }
         }
 
-        private YamlMapping parseFlowMapping(int depth, String anchor) {
+        /**
+         * Reads the key after "?" in a flow collection; the key may be empty.
+         */
+        private YamlNode readExplicitKey(char close, int depth) {
+            skipSeparation();
+            if (peek() == ',' || peek() == close || isValueIndicator()) {
+                return emptyNode(NodeProperties.NONE);
+            }
+            YamlNode key = parseFlowNode(depth);
+            skipSeparation();
+            return key;
+        }
+
+        /**
+         * Builds a single-pair mapping inside a flow sequence; the position is at ":" or after the key.
+         */
+        private YamlMapping readPair(YamlNode key, char close, int depth) {
             ensureDepth(depth);
-            YamlMapping mapping = new YamlMapping(null, anchor);
-            open(anchor, mapping);
+            YamlMapping pair = new YamlMapping();
+            pair.put(checkScalarKey(key, lineNumber), readValue(key, close, depth));
+            return pair;
+        }
+
+        /**
+         * Reads the value after a key: after ":" when present, otherwise an empty node.
+         */
+        private YamlNode readValue(YamlNode key, char close, int depth) {
+            if (!isPairSeparator(key) && !isValueIndicator()) {
+                return emptyNode(NodeProperties.NONE);
+            }
+            position++;
+            skipSeparation();
+            YamlNode value = peek() == ',' || peek() == close ? emptyNode(NodeProperties.NONE) : parseFlowNode(depth);
+            skipSeparation();
+            return value;
+        }
+
+        private YamlMapping parseFlowMapping(int depth, NodeProperties properties) {
+            ensureDepth(depth);
+            YamlMapping mapping = new YamlMapping(properties.tag(), properties.anchor());
+            open(properties, mapping);
             try {
                 position++;
                 while (true) {
@@ -1241,28 +1438,20 @@ public final class YamlParser {
                         position++;
                         return mapping;
                     }
-                    if (isIndicator('?')) {
-                        throw new YamlParseException("Complex mapping keys are not supported at line " + lineNumber);
-                    }
-                    if (isValueIndicator()) {
-                        throw new YamlParseException("Empty mapping keys are not supported at line " + lineNumber);
-                    }
                     int keyLine = lineNumber;
-                    YamlNode key = checkScalarKey(parseFlowNode(depth), keyLine);
-                    skipSeparation();
-                    YamlNode value;
-                    if (isPairSeparator(key)) {
+                    YamlNode key;
+                    if (isIndicator('?')) {
                         position++;
-                        skipSeparation();
-                        value = peek() == ',' || peek() == '}' ? emptyNode(null) : parseFlowNode(depth);
-                        skipSeparation();
+                        key = readExplicitKey('}', depth);
+                    } else if (isValueIndicator()) {
+                        key = emptyNode(NodeProperties.NONE);
                     } else {
-                        value = emptyNode(null);
+                        key = parseFlowNode(depth);
+                        skipSeparation();
                     }
-                    if (mapping.containsKey(keyText(key))) {
-                        throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + keyLine);
-                    }
-                    mapping.put(key, value);
+                    checkScalarKey(key, keyLine);
+                    ensureUniqueKey(mapping, key, keyLine);
+                    mapping.put(key, readValue(key, '}', depth));
                     if (!nextEntry('}')) {
                         return mapping;
                     }
@@ -1291,25 +1480,25 @@ public final class YamlParser {
         }
 
         private YamlNode parseFlowNode(int depth) {
-            Properties properties = readProperties(text, position, lineNumber, true);
-            position = properties.end();
-            String anchor = properties.anchor();
-            if (anchor != null) {
+            PropertyScan scan = readProperties(text, position, lineNumber, true);
+            position = scan.end();
+            NodeProperties properties = scan.properties();
+            if (!properties.isEmpty()) {
                 skipSeparation();
             }
             char ch = peek();
             if (ch == ',' || ch == ']' || ch == '}' || isValueIndicator()) {
-                if (anchor == null) {
+                if (properties.isEmpty()) {
                     throw new YamlParseException("Missing flow collection entry at line " + lineNumber);
                 }
-                return emptyNode(anchor);
+                return emptyNode(properties);
             }
             switch (ch) {
                 case '[' -> {
-                    return parseFlowSequence(depth + 1, anchor);
+                    return parseFlowSequence(depth + 1, properties);
                 }
                 case '{' -> {
-                    return parseFlowMapping(depth + 1, anchor);
+                    return parseFlowMapping(depth + 1, properties);
                 }
                 case '"', '\'' -> {
                     Quoted quoted = readQuoted(text, position, lineNumber, parentIndent, true);
@@ -1320,11 +1509,11 @@ public final class YamlParser {
                         position = quoted.end();
                         lineNumber = quoted.lineNumber();
                     }
-                    return register(new YamlScalar(quoted.value(), null, anchor, quoted.style()));
+                    return register(new YamlScalar(quoted.value(), properties.tag(), properties.anchor(), quoted.style()));
                 }
                 case '*' -> {
-                    if (anchor != null) {
-                        throw new YamlParseException("An alias cannot have an anchor at line " + lineNumber);
+                    if (!properties.isEmpty()) {
+                        throw new YamlParseException("An alias cannot have properties at line " + lineNumber);
                     }
                     int start = ++position;
                     while (position < text.length() && isAnchorChar(text.charAt(position))) {
@@ -1346,7 +1535,7 @@ public final class YamlParser {
                 default -> {
                 }
             }
-            return register(new YamlScalar(readFlowPlain(), null, anchor, YamlScalarStyle.PLAIN));
+            return register(new YamlScalar(readFlowPlain(), properties.tag(), properties.anchor(), YamlScalarStyle.PLAIN));
         }
 
         /**
@@ -1469,9 +1658,33 @@ public final class YamlParser {
     }
 
     /**
+     * Anchor and tag of a node; either may be {@code null}.
+     */
+    private record NodeProperties(String anchor, String tag) {
+        static final NodeProperties NONE = new NodeProperties(null, null);
+
+        boolean isEmpty() {
+            return anchor == null && tag == null;
+        }
+
+        /**
+         * Combines properties given on a preceding line with those on the node's own line.
+         */
+        NodeProperties combine(NodeProperties inner, int lineNumber) {
+            if (anchor != null && inner.anchor() != null) {
+                throw new YamlParseException("A node cannot have two anchors at line " + lineNumber);
+            }
+            if (tag != null && inner.tag() != null) {
+                throw new YamlParseException("A node cannot have two tags at line " + lineNumber);
+            }
+            return new NodeProperties(anchor != null ? anchor : inner.anchor(), tag != null ? tag : inner.tag());
+        }
+    }
+
+    /**
      * @param end position after the properties and the white space that follows them
      */
-    private record Properties(String anchor, int end) {
+    private record PropertyScan(NodeProperties properties, int end) {
     }
 
     private record Quoted(String value, YamlScalarStyle style, String lineText, int end, int lineNumber) {

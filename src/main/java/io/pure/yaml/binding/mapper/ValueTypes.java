@@ -21,6 +21,7 @@ import java.time.ZonedDateTime;
 import java.util.Currency;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -52,16 +53,24 @@ final class ValueTypes {
         new Codec(Charset.class, Charset::forName, value -> ((Charset) value).name())
     );
 
+    /** The codec of each class, looked up once instead of testing every codec for every value. */
+    private static final ClassValue<Optional<Codec>> BY_CLASS = new ClassValue<>() {
+        @Override
+        protected Optional<Codec> computeValue(Class<?> type) {
+            for (Codec codec : CODECS) {
+                if (codec.type().isAssignableFrom(type)) {
+                    return Optional.of(codec);
+                }
+            }
+            return Optional.empty();
+        }
+    };
+
     private ValueTypes() {
     }
 
     static Codec forValue(Object value) {
-        for (Codec codec : CODECS) {
-            if (codec.type().isInstance(value)) {
-                return codec;
-            }
-        }
-        return null;
+        return BY_CLASS.get(value.getClass()).orElse(null);
     }
 
     static Codec forType(Class<?> type) {

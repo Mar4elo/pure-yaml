@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -30,7 +31,6 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
-import java.util.regex.Pattern;
 
 import io.pure.yaml.annotation.YamlInclude;
 import io.pure.yaml.binding.adapter.TypeAdapter;
@@ -50,18 +50,14 @@ import io.pure.yaml.core.model.YamlSequence;
 import io.pure.yaml.core.model.YamlTags;
 import io.pure.yaml.core.parser.YamlEncoding;
 import io.pure.yaml.core.parser.YamlParser;
+import io.pure.yaml.core.parser.YamlProcessingLimits;
 
 public final class YamlMapper {
-    private static final Pattern INTEGER = Pattern.compile("[-+]?[0-9]+");
-    private static final Pattern OCTAL = Pattern.compile("0o[0-7]+");
-    private static final Pattern HEXADECIMAL = Pattern.compile("0x[0-9a-fA-F]+");
-    private static final Pattern DECIMAL = Pattern.compile("[-+]?(\\.[0-9]+|[0-9]+(\\.[0-9]*)?)([eE][-+]?[0-9]+)?");
-    private static final Pattern INFINITY = Pattern.compile("[-+]?\\.(inf|Inf|INF)");
-    private static final Pattern NOT_A_NUMBER = Pattern.compile("\\.(nan|NaN|NAN)");
-
     private final YamlMapperConfig config;
     private final ClassIntrospector introspector = new ClassIntrospector();
     private final ConcurrentHashMap<Type, TypeAdapter<?>> adapters = new ConcurrentHashMap<>();
+    /** Key scalars of bean properties, shared between written mappings (their number is bounded by the bound classes). */
+    private final ConcurrentHashMap<String, YamlScalar> keyScalars = new ConcurrentHashMap<>();
 
     public YamlMapper() {
         this(YamlMapperConfig.defaults());
@@ -230,7 +226,7 @@ public final class YamlMapper {
             if (propertyValue == null && (!config.writeNulls() || inclusion == YamlInclude.Include.NON_NULL)) {
                 continue;
             }
-            mapping.put(property.yamlName(), toYamlNodeInternal(propertyValue, activeObjects));
+            mapping.put(keyScalars.computeIfAbsent(property.yamlName(), YamlScalar::plain), toYamlNodeInternal(propertyValue, activeObjects));
         }
         return mapping;
     }
@@ -318,7 +314,21 @@ public final class YamlMapper {
         if (node instanceof YamlAlias alias && config.resolveAliases()) {
             return context.expand(alias, path, target -> readValueInternal(target, type, path, context));
         }
-        context.visitNode(path);
+        if (node.anchor() != null && config.resolveAliases()) {
+            // An anchored node is read once per call; its aliases share the result (as in SnakeYAML).
+            Map<Type, Object> byType = context.resolved.computeIfAbsent(node, ignored -> new HashMap<>(2));
+            if (byType.containsKey(type)) {
+                return byType.get(type);
+            }
+            Object value = readTracked(node, type, rawClass, path, context);
+            byType.put(type, value);
+            return value;
+        }
+        return readTracked(node, type, rawClass, path, context);
+    }
+
+    private Object readTracked(YamlNode node, Type type, Class<?> rawClass, String path, ReadContext context) {
+        context.readNodes++;
         boolean collection = node instanceof YamlMapping || node instanceof YamlSequence;
         if (collection) {
             context.enterCollection(path);
@@ -469,7 +479,7 @@ public final class YamlMapper {
         String value = scalarText(scalar);
         String tag = scalar.tag();
         if (YamlTags.INT.equals(tag)) {
-            if (!INTEGER.matcher(value).matches() && !HEXADECIMAL.matcher(value).matches() && !OCTAL.matcher(value).matches()) {
+            if (!CoreSchema.isInteger(CoreSchema.classify(value))) {
                 throw new YamlMappingException("Invalid !!int value at " + path + ": " + abbreviate(value));
             }
             return resolvePlainScalar(value, path);
@@ -533,9 +543,20 @@ public final class YamlMapper {
             default -> {
             }
         }
-        if (INTEGER.matcher(value).matches() || HEXADECIMAL.matcher(value).matches() || OCTAL.matcher(value).matches()) {
+        CoreSchema.Kind kind = CoreSchema.classify(value);
+        if (CoreSchema.isInteger(kind)) {
             checkNumberLength(value, path);
-            BigInteger integer = parseDecimal(value, path).toBigIntegerExact();
+            if (kind == CoreSchema.Kind.DECIMAL_INTEGER && value.length() <= 18) {
+                long number = Long.parseLong(value);
+                // Not a conditional expression: it would promote both boxes to long.
+                if (number == (int) number) {
+                    return (int) number;
+                }
+                return number;
+            }
+            BigInteger integer = kind == CoreSchema.Kind.DECIMAL_INTEGER
+                ? new BigInteger(value)
+                : new BigInteger(value.substring(2), kind == CoreSchema.Kind.HEX_INTEGER ? 16 : 8);
             if (integer.bitLength() < Integer.SIZE) {
                 return integer.intValue();
             }
@@ -544,7 +565,7 @@ public final class YamlMapper {
             }
             return integer;
         }
-        if (INFINITY.matcher(value).matches() || NOT_A_NUMBER.matcher(value).matches() || DECIMAL.matcher(value).matches()) {
+        if (CoreSchema.isNumber(kind)) {
             checkNumberLength(value, path);
             return readDouble(value, path);
         }
@@ -644,8 +665,26 @@ public final class YamlMapper {
             if (type == Float.class) {
                 return readFloat(lexical, path);
             }
-            if (type == Number.class && (INFINITY.matcher(lexical).matches() || NOT_A_NUMBER.matcher(lexical).matches())) {
+            CoreSchema.Kind kind = CoreSchema.classify(lexical);
+            if (type == Number.class && (kind == CoreSchema.Kind.INFINITY || kind == CoreSchema.Kind.NAN)) {
                 return readDouble(lexical, path);
+            }
+            if (kind == CoreSchema.Kind.DECIMAL_INTEGER && lexical.length() <= 18
+                && (type == Byte.class || type == Short.class || type == Integer.class || type == Long.class)) {
+                long number = Long.parseLong(lexical);
+                if (type == Long.class) {
+                    return number;
+                }
+                if (type == Integer.class && number == (int) number) {
+                    return (int) number;
+                }
+                if (type == Short.class && number == (short) number) {
+                    return (short) number;
+                }
+                if (type == Byte.class && number == (byte) number) {
+                    return (byte) number;
+                }
+                throw new ArithmeticException("Overflow");
             }
             if (type == Byte.class) {
                 return parseDecimal(lexical, path).byteValueExact();
@@ -672,13 +711,14 @@ public final class YamlMapper {
     }
 
     private double readDouble(String lexical, String path) {
-        if (INFINITY.matcher(lexical).matches()) {
+        CoreSchema.Kind kind = CoreSchema.classify(lexical);
+        if (kind == CoreSchema.Kind.INFINITY) {
             return lexical.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
         }
-        if (NOT_A_NUMBER.matcher(lexical).matches()) {
+        if (kind == CoreSchema.Kind.NAN) {
             return Double.NaN;
         }
-        double value = DECIMAL.matcher(lexical).matches()
+        double value = kind == CoreSchema.Kind.DECIMAL_INTEGER || kind == CoreSchema.Kind.FLOAT
             ? Double.parseDouble(lexical)
             : parseDecimal(lexical, path).doubleValue();
         if (Double.isInfinite(value)) {
@@ -688,13 +728,14 @@ public final class YamlMapper {
     }
 
     private float readFloat(String lexical, String path) {
-        if (INFINITY.matcher(lexical).matches()) {
+        CoreSchema.Kind kind = CoreSchema.classify(lexical);
+        if (kind == CoreSchema.Kind.INFINITY) {
             return lexical.startsWith("-") ? Float.NEGATIVE_INFINITY : Float.POSITIVE_INFINITY;
         }
-        if (NOT_A_NUMBER.matcher(lexical).matches()) {
+        if (kind == CoreSchema.Kind.NAN) {
             return Float.NaN;
         }
-        float value = DECIMAL.matcher(lexical).matches()
+        float value = kind == CoreSchema.Kind.DECIMAL_INTEGER || kind == CoreSchema.Kind.FLOAT
             ? Float.parseFloat(lexical)
             : parseDecimal(lexical, path).floatValue();
         if (Float.isInfinite(value)) {
@@ -705,13 +746,14 @@ public final class YamlMapper {
 
     private static BigDecimal parseDecimal(String lexical, String path) {
         try {
-            if (HEXADECIMAL.matcher(lexical).matches()) {
+            CoreSchema.Kind kind = CoreSchema.classify(lexical);
+            if (kind == CoreSchema.Kind.HEX_INTEGER) {
                 return new BigDecimal(new BigInteger(lexical.substring(2), 16));
             }
-            if (OCTAL.matcher(lexical).matches()) {
+            if (kind == CoreSchema.Kind.OCTAL_INTEGER) {
                 return new BigDecimal(new BigInteger(lexical.substring(2), 8));
             }
-            if (DECIMAL.matcher(lexical).matches()) {
+            if (kind == CoreSchema.Kind.DECIMAL_INTEGER || kind == CoreSchema.Kind.FLOAT) {
                 return new BigDecimal(lexical);
             }
         } catch (NumberFormatException exception) {
@@ -946,30 +988,87 @@ public final class YamlMapper {
     }
 
     /**
-     * State of one readValue call: nesting depth and the number of nodes read through aliases,
-     * which bounds exponential expansion such as the "billion laughs" input (RFC 9512, 4.2).
+     * State of one readValue call. Anchored nodes are read once and shared by their aliases; the
+     * logical size and depth that aliases add are still limited, which bounds exponential expansion
+     * such as the "billion laughs" input (RFC 9512, 4.2) for whoever traverses the result.
      */
     private final class ReadContext {
+        private final IdentityHashMap<YamlNode, Map<Type, Object>> resolved = new IdentityHashMap<>();
+        private final IdentityHashMap<YamlNode, long[]> shapes = new IdentityHashMap<>();
         private int depth;
-        private int expandedNodes;
-        private int expansionDepth;
+        private long expandedNodes;
+        /** Nodes of the document read so far; expansion may grow proportionally to the document. */
+        private long readNodes;
 
+        /**
+         * Reads the anchored node of an alias. The limits apply to the logical (expanded) size and depth
+         * of the target, computed once per node, so that sharing the result keeps the same guarantees.
+         */
         Object expand(YamlAlias alias, String path, Function<YamlNode, Object> reader) {
-            if (alias.target() == null) {
+            YamlNode target = alias.target();
+            if (target == null) {
                 throw new YamlMappingException("Unresolved alias at " + path + ": *" + alias.alias());
             }
-            expansionDepth++;
-            try {
-                return reader.apply(alias.target());
-            } finally {
-                expansionDepth--;
-            }
-        }
-
-        void visitNode(String path) {
-            if (expansionDepth > 0 && ++expandedNodes > config.processingLimits().maxAliasExpansion()) {
+            YamlProcessingLimits limits = config.processingLimits();
+            long[] shape = shape(target, depth, path);
+            expandedNodes = saturatedAdd(expandedNodes, shape[0]);
+            long allowed = Math.max(limits.maxAliasExpansion(), saturatedMultiply(limits.aliasExpansionRatio(), readNodes));
+            if (expandedNodes > allowed) {
                 throw new YamlMappingException("Alias expansion exceeds configured limit at " + path);
             }
+            if (depth + shape[1] > limits.maxDepth()) {
+                throw new YamlMappingException("Nesting depth exceeds configured limit at " + path);
+            }
+            return reader.apply(target);
+        }
+
+        /**
+         * Logical node count and collection depth of a node with aliases expanded, memoized per node.
+         * The walk stops at the depth limit, so long chains of aliases cannot exhaust the stack.
+         */
+        private long[] shape(YamlNode node, int level, String path) {
+            if (node instanceof YamlAlias alias) {
+                return alias.target() == null ? new long[]{1, 0} : shape(alias.target(), level, path);
+            }
+            if (node instanceof YamlScalar) {
+                return new long[]{1, 0};
+            }
+            long[] known = shapes.get(node);
+            if (known != null) {
+                return known;
+            }
+            if (level >= config.processingLimits().maxDepth()) {
+                throw new YamlMappingException("Nesting depth exceeds configured limit at " + path);
+            }
+            long size = 1;
+            long childDepth = 0;
+            if (node instanceof YamlMapping mapping) {
+                for (YamlEntry entry : mapping.entries()) {
+                    long[] key = shape(entry.key(), level + 1, path);
+                    long[] value = shape(entry.value(), level + 1, path);
+                    size = saturatedAdd(saturatedAdd(size, key[0]), value[0]);
+                    childDepth = Math.max(childDepth, Math.max(key[1], value[1]));
+                }
+            } else if (node instanceof YamlSequence sequence) {
+                for (YamlNode item : sequence.values()) {
+                    long[] value = shape(item, level + 1, path);
+                    size = saturatedAdd(size, value[0]);
+                    childDepth = Math.max(childDepth, value[1]);
+                }
+            }
+            long[] result = {size, childDepth + 1};
+            shapes.put(node, result);
+            return result;
+        }
+
+        private static long saturatedMultiply(long left, long right) {
+            long product = left * right;
+            return right != 0 && product / right != left ? Long.MAX_VALUE : product;
+        }
+
+        private static long saturatedAdd(long left, long right) {
+            long sum = left + right;
+            return sum < 0 ? Long.MAX_VALUE : sum;
         }
 
         void enterCollection(String path) {

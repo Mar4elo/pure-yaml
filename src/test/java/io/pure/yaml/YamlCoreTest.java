@@ -1,6 +1,7 @@
 package io.pure.yaml;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -523,6 +524,26 @@ class YamlCoreTest {
         YamlMapping mapping = new YamlMapping();
         mapping.put("a", new YamlScalar("1"));
         assertThrows(IllegalArgumentException.class, () -> mapping.put("a", new YamlScalar("2")));
+        assertFalse(mapping.putIfAbsent(YamlScalar.plain("a"), new YamlScalar("3")));
+        assertEquals(1, mapping.size());
+    }
+
+    @Test
+    void looksUpKeysInSmallAndLargeMappings() {
+        // Small mappings are searched linearly, larger ones through an index built on the way.
+        YamlMapping mapping = new YamlMapping();
+        for (int i = 0; i < 20; i++) {
+            assertTrue(mapping.putIfAbsent(YamlScalar.plain("key" + i), new YamlScalar(String.valueOf(i))));
+            for (int j = 0; j <= i; j++) {
+                assertEquals(String.valueOf(j), scalar(mapping.get("key" + j)), "key" + j + " after " + (i + 1) + " entries");
+            }
+            assertFalse(mapping.containsKey("missing"));
+            assertFalse(mapping.putIfAbsent(YamlScalar.plain("key" + i), new YamlScalar("duplicate")));
+        }
+        assertEquals(20, mapping.size());
+        mapping.put(YamlScalar.plain(null), new YamlScalar("empty key"));
+        assertEquals("empty key", scalar(mapping.get(null)));
+        assertThrows(UnsupportedOperationException.class, () -> mapping.entries().clear());
     }
 
     @Test

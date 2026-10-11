@@ -88,7 +88,7 @@ public final class YamlWriter {
 
     private void appendRoot(StringBuilder builder, YamlNode node, State state) {
         if (isInline(node)) {
-            appendInline(builder, node, new Position(-1, indentUnit.length()), state);
+            appendInline(builder, node, -1, indentUnit.length(), state);
             builder.append('\n');
         } else {
             if (appendProperties(builder, node, state)) {
@@ -145,7 +145,7 @@ public final class YamlWriter {
             first = false;
             builder.append("- ");
             if (isInline(item)) {
-                appendInline(builder, item, new Position(column, column + 2), state);
+                appendInline(builder, item, column, column + 2, state);
                 builder.append('\n');
             } else if (appendProperties(builder, item, state)) {
                 // "- &anchor !tag" followed by the collection on the next lines.
@@ -165,19 +165,18 @@ public final class YamlWriter {
                 indent(builder, column);
             }
             first = false;
-            String key = renderKey(entry.key(), state);
-            if (key.codePointCount(0, key.length()) > MAX_IMPLICIT_KEY_LENGTH) {
+            int keyStart = builder.length();
+            appendKey(builder, entry.key(), state);
+            if (builder.codePointCount(keyStart, builder.length()) > MAX_IMPLICIT_KEY_LENGTH) {
                 // Implicit keys are limited to 1024 characters (YAML 1.2.2, 7.4.2 and 8.2.1); longer keys
                 // are written as explicit entries: "? key" followed by ": value".
-                builder.append("? ").append(key).append('\n');
+                builder.insert(keyStart, "? ").append('\n');
                 indent(builder, column);
-            } else {
-                builder.append(key);
             }
             builder.append(':');
             if (isInline(entry.value())) {
                 builder.append(' ');
-                appendInline(builder, entry.value(), new Position(column, column + indentUnit.length()), state);
+                appendInline(builder, entry.value(), column, column + indentUnit.length(), state);
                 builder.append('\n');
             } else {
                 if (hasProperties(entry.value())) {
@@ -191,22 +190,20 @@ public final class YamlWriter {
         }
     }
 
-    private String renderKey(YamlNode key, State state) {
+    private void appendKey(StringBuilder builder, YamlNode key, State state) {
         state.endsWithKeptLines = false;
-        StringBuilder rendered = new StringBuilder();
         if (key instanceof YamlAlias alias) {
-            appendAlias(rendered, alias, state);
+            appendAlias(builder, alias, state);
             // Anchor names may contain ':', so the separator must not touch the alias.
-            rendered.append(' ');
+            builder.append(' ');
         } else if (key instanceof YamlScalar scalar && scalar.value() == null) {
             // An empty key: only its properties, followed by white space before ':'.
-            appendProperties(rendered, scalar, state);
+            appendProperties(builder, scalar, state);
         } else if (key instanceof YamlScalar scalar) {
-            appendInline(rendered, scalar, null, state);
+            appendInline(builder, scalar, -1, -1, state);
         } else {
             throw new YamlWriteException("Current writer supports only scalar mapping keys");
         }
-        return rendered.toString();
     }
 
     private static boolean isInline(YamlNode node) {
@@ -219,9 +216,10 @@ public final class YamlWriter {
     /**
      * Writes a node that starts on the current line.
      *
-     * @param position where block scalar content goes, or {@code null} for mapping keys (single-line only)
+     * @param parentIndent  indentation of the enclosing collection (-1 for a document root)
+     * @param contentColumn column of block scalar content lines, or -1 for mapping keys (single-line only)
      */
-    private void appendInline(StringBuilder builder, YamlNode node, Position position, State state) {
+    private void appendInline(StringBuilder builder, YamlNode node, int parentIndent, int contentColumn, State state) {
         state.endsWithKeptLines = false;
         boolean withProperties = appendProperties(builder, node, state);
         switch (node) {
@@ -233,7 +231,7 @@ public final class YamlWriter {
                     } else if (!builder.isEmpty() && builder.charAt(builder.length() - 1) == ' ') {
                         builder.setLength(builder.length() - 1);
                     }
-                } else if (position == null || !appendLiteral(builder, scalar, position, state)) {
+                } else if (contentColumn < 0 || !appendLiteral(builder, scalar, parentIndent, contentColumn, state)) {
                     appendScalar(builder, scalar);
                 }
             }
@@ -249,12 +247,11 @@ public final class YamlWriter {
      *
      * @return {@code false} when the value has to be written as a quoted scalar instead
      */
-    private boolean appendLiteral(StringBuilder builder, YamlScalar scalar, Position position, State state) {
+    private boolean appendLiteral(StringBuilder builder, YamlScalar scalar, int parentIndent, int contentColumn, State state) {
         String value = scalar.value();
         boolean blockStyle = scalar.style() == YamlScalarStyle.LITERAL || scalar.style() == YamlScalarStyle.FOLDED
             || scalar.style() == YamlScalarStyle.PLAIN;
-        if (!blockStyle || value.indexOf('\n') < 0
-            || !value.codePoints().allMatch(codePoint -> codePoint == '\n' || codePoint == '\t' || !needsEscape(codePoint))) {
+        if (!blockStyle || value.indexOf('\n') < 0 || !fitsLiteralBlock(value)) {
             return false;
         }
         int trailingBreaks = 0;
@@ -274,7 +271,7 @@ public final class YamlWriter {
             }
         }
         // Leading spaces on the first content line would be taken as indentation without an indicator.
-        int indentation = position.contentColumn() - Math.max(position.parentIndent(), 0);
+        int indentation = contentColumn - Math.max(parentIndent, 0);
         boolean indicator = firstContent.startsWith(" ");
         if (indicator && (indentation < 1 || indentation > 9)) {
             return false;
@@ -291,7 +288,7 @@ public final class YamlWriter {
         for (String line : lines) {
             builder.append('\n');
             if (!line.isEmpty()) {
-                indent(builder, position.contentColumn());
+                indent(builder, contentColumn);
                 builder.append(line);
             }
         }
@@ -376,7 +373,7 @@ public final class YamlWriter {
             // Block scalars that cannot be written as literal blocks keep their value as double-quoted scalars.
             case DOUBLE_QUOTED, LITERAL, FOLDED -> appendDoubleQuoted(builder, value);
             case SINGLE_QUOTED -> {
-                if (value.codePoints().anyMatch(YamlWriter::needsEscape)) {
+                if (containsCharacterToEscape(value)) {
                     appendDoubleQuoted(builder, value);
                 } else {
                     builder.append('\'').append(value.replace("'", "''")).append('\'');
@@ -400,7 +397,7 @@ public final class YamlWriter {
         if (isBlank(first) || isBlank(value.charAt(value.length() - 1))) {
             return true;
         }
-        if (value.codePoints().anyMatch(YamlWriter::needsEscape)) {
+        if (containsCharacterToEscape(value)) {
             return true;
         }
         if (PLAIN_FORBIDDEN_FIRST.indexOf(first) >= 0) {
@@ -426,7 +423,9 @@ public final class YamlWriter {
 
     private static void appendDoubleQuoted(StringBuilder builder, String value) {
         builder.append('"');
-        value.codePoints().forEach(codePoint -> {
+        for (int i = 0; i < value.length(); ) {
+            int codePoint = value.codePointAt(i);
+            i += Character.charCount(codePoint);
             switch (codePoint) {
                 case '\\' -> builder.append("\\\\");
                 case '"' -> builder.append("\\\"");
@@ -454,8 +453,33 @@ public final class YamlWriter {
                     }
                 }
             }
-        });
+        }
         builder.append('"');
+    }
+
+    private static boolean containsCharacterToEscape(String value) {
+        for (int i = 0; i < value.length(); ) {
+            int codePoint = value.codePointAt(i);
+            if (needsEscape(codePoint)) {
+                return true;
+            }
+            i += Character.charCount(codePoint);
+        }
+        return false;
+    }
+
+    /**
+     * Whether every character can appear in a literal block scalar: printable ones, tabs and line feeds.
+     */
+    private static boolean fitsLiteralBlock(String value) {
+        for (int i = 0; i < value.length(); ) {
+            int codePoint = value.codePointAt(i);
+            if (codePoint != '\n' && codePoint != '\t' && needsEscape(codePoint)) {
+                return false;
+            }
+            i += Character.charCount(codePoint);
+        }
+        return true;
     }
 
     /**
@@ -482,15 +506,6 @@ public final class YamlWriter {
 
     private static void indent(StringBuilder builder, int column) {
         builder.repeat(' ', column);
-    }
-
-    /**
-     * Layout of a node's own lines.
-     *
-     * @param parentIndent  indentation of the enclosing collection (-1 for a document root)
-     * @param contentColumn column of block scalar content lines
-     */
-    private record Position(int parentIndent, int contentColumn) {
     }
 
     /**

@@ -138,11 +138,56 @@ class YamlAnchorTest {
         ));
         assertTrue(exception.getMessage().contains("Alias expansion exceeds configured limit"));
 
+        // With a ratio of 0, maxAliasExpansion is an absolute limit.
         YamlMapper strict = YamlMapper.builder()
+            .resolveAliases(true)
+            .processingLimits(new YamlProcessingLimits(64, 16, 1, 1_000, 1_000, 2, 0))
+            .build();
+        assertThrows(YamlMappingException.class, () -> strict.readValue("a: &x [1, 2, 3]\nb: *x", Object.class));
+        // The default ratio lets aliases add up to 10 nodes per node of the document.
+        YamlMapper proportional = YamlMapper.builder()
             .resolveAliases(true)
             .processingLimits(new YamlProcessingLimits(64, 16, 1, 1_000, 1_000, 2))
             .build();
-        assertThrows(YamlMappingException.class, () -> strict.readValue("a: &x [1, 2, 3]\nb: *x", Object.class));
+        assertEquals(List.of(1, 2, 3), ((Map<?, ?>) proportional.readValue("a: &x [1, 2, 3]\nb: *x", Object.class)).get("b"));
+    }
+
+    @Test
+    void acceptsManyAliasesWithDefaultLimits() {
+        YamlMapper mapper = YamlMapper.builder().resolveAliases(true).build();
+        Config config = mapper.readValue(manyServices(10_000), Config.class);
+        assertEquals(10_000, config.services().size());
+        assertEquals(new Settings(30, 3), config.services().getLast().settings());
+    }
+
+    @Test
+    void sharesTheValueOfAnAnchoredNodeBetweenItsAliases() {
+        YamlMapper mapper = YamlMapper.builder().resolveAliases(true).build();
+        Config config = mapper.readValue(CONFIG, Config.class);
+        assertSame(config.defaults(), config.services().get(0).settings());
+        assertSame(config.services().get(0).settings(), config.services().get(1).settings());
+
+        Map<?, ?> untyped = (Map<?, ?>) mapper.readValue("a: &x {k: v}\nb: *x\nc: *x", Object.class);
+        assertSame(untyped.get("a"), untyped.get("b"));
+        assertSame(untyped.get("b"), untyped.get("c"));
+        // The same anchored node read as two types yields one value per type.
+        TwoViews views = mapper.readValue("raw: &x {timeout: 1, retries: 2}\ntyped: *x", TwoViews.class);
+        assertEquals(Map.of("timeout", 1, "retries", 2), views.raw());
+        assertEquals(new Settings(1, 2), views.typed());
+    }
+
+    @Test
+    void rejectsLongAliasChainsWithoutExhaustingTheStack() {
+        StringBuilder chain = new StringBuilder("l0: &l0 [x]\n");
+        for (int level = 1; level <= 20_000; level++) {
+            chain.append('l').append(level).append(": &l").append(level).append(" [*l").append(level - 1).append("]\n");
+        }
+        YamlMapper mapper = YamlMapper.builder()
+            .resolveAliases(true)
+            .processingLimits(new YamlProcessingLimits(128, 100_000, 1, 1_000_000))
+            .build();
+        YamlMappingException exception = assertThrows(YamlMappingException.class, () -> mapper.readValue(chain.toString(), Object.class));
+        assertTrue(exception.getMessage().contains("Nesting depth exceeds configured limit"));
     }
 
     @Test
@@ -165,6 +210,14 @@ class YamlAnchorTest {
         assertInstanceOf(YamlAlias.class, tree.get("b"));
     }
 
+    private static String manyServices(int aliases) {
+        StringBuilder text = new StringBuilder("defaults: &defaults\n  timeout: 30\n  retries: 3\nservices:\n");
+        for (int i = 0; i < aliases; i++) {
+            text.append("  - name: service").append(i).append("\n    settings: *defaults\n");
+        }
+        return text.toString();
+    }
+
     private static String target(YamlNode node) {
         return ((YamlScalar) ((YamlAlias) node).target()).value();
     }
@@ -176,5 +229,8 @@ class YamlAnchorTest {
     }
 
     record Config(Settings defaults, List<Service> services) {
+    }
+
+    record TwoViews(Map<String, Integer> raw, Settings typed) {
     }
 }

@@ -361,7 +361,6 @@ public final class YamlParser {
                 if (isIndicatorWithBlank(content, '?')) {
                     // Explicit entry (YAML 1.2.2, 8.2.2): "? key" and an optional ": value" at the same indentation.
                     YamlNode key = checkScalarKey(parseIndicatedNode(line, indent, depth, true), line.lineNumber());
-                    ensureUniqueKey(mapping, key, line.lineNumber());
                     skipIgnorable();
                     YamlNode value = emptyNode(NodeProperties.NONE);
                     if (index < lines.size()) {
@@ -370,7 +369,7 @@ public final class YamlParser {
                             value = parseIndicatedNode(valueLine, indent, depth, true);
                         }
                     }
-                    mapping.put(key, value);
+                    putUnique(mapping, key, value, line.lineNumber());
                     continue;
                 }
                 int separator = findKeySeparator(content);
@@ -380,12 +379,11 @@ public final class YamlParser {
                 index++;
                 ensureImplicitKeyLength(content, 0, separator, line.lineNumber());
                 YamlNode key = parseKey(content.substring(0, separator), line.lineNumber(), depth);
-                ensureUniqueKey(mapping, key, line.lineNumber());
                 String rawValue = trim(content.substring(separator + 1));
                 YamlNode value = rawValue.isEmpty() || rawValue.startsWith("#")
                     ? parseBlockValue(indent, depth, true, NodeProperties.NONE)
                     : parseInlineValue(rawValue, line.trailing(), line.lineNumber(), indent, depth, Context.VALUE, NodeProperties.NONE);
-                mapping.put(key, value);
+                putUnique(mapping, key, value, line.lineNumber());
             }
         } finally {
             close(mapping);
@@ -401,8 +399,8 @@ public final class YamlParser {
         return checkScalarKey(parseInlineValue(key, "", lineNumber, -1, depth, Context.KEY, NodeProperties.NONE), lineNumber);
     }
 
-    private static void ensureUniqueKey(YamlMapping mapping, YamlNode key, int lineNumber) {
-        if (mapping.containsKey(keyText(key))) {
+    private static void putUnique(YamlMapping mapping, YamlNode key, YamlNode value, int lineNumber) {
+        if (!mapping.putIfAbsent(key, value)) {
             throw new YamlParseException("Duplicate mapping key '" + keyText(key) + "' at line " + lineNumber);
         }
     }
@@ -1450,8 +1448,7 @@ public final class YamlParser {
                         skipSeparation();
                     }
                     checkScalarKey(key, keyLine);
-                    ensureUniqueKey(mapping, key, keyLine);
-                    mapping.put(key, readValue(key, '}', depth));
+                    putUnique(mapping, key, readValue(key, '}', depth), keyLine);
                     if (!nextEntry('}')) {
                         return mapping;
                     }

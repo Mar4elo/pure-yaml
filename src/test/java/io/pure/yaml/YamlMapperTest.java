@@ -284,6 +284,24 @@ class YamlMapperTest {
     }
 
     @Test
+    void readsIntegersAtTheEdgesOfEachType() {
+        assertEquals(2_147_483_647, mapper.readValue("2147483647", Object.class));
+        assertEquals(2_147_483_648L, mapper.readValue("2147483648", Object.class));
+        assertEquals(-2_147_483_648, mapper.readValue("-2147483648", Object.class));
+        assertEquals(999_999_999_999_999_999L, mapper.readValue("999999999999999999", Object.class));
+        assertEquals(new BigInteger("9223372036854775808"), mapper.readValue("9223372036854775808", Object.class));
+        assertEquals(5, mapper.readValue("+5", Object.class));
+        assertEquals(0, mapper.readValue("-0", Object.class));
+        assertEquals((byte) 127, mapper.readValue("127", byte.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("128", byte.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("32768", short.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("2147483648", int.class));
+        assertEquals(Long.MAX_VALUE, mapper.readValue("9223372036854775807", long.class));
+        assertThrows(YamlMappingException.class, () -> mapper.readValue("9223372036854775808", long.class));
+        assertEquals(1000, mapper.readValue("1e3", int.class));
+    }
+
+    @Test
     void reportsInvalidNumbersAsMappingErrors() {
         YamlMappingException invalid = assertThrows(YamlMappingException.class, () -> mapper.readValue("value: abc", IntHolder.class));
         assertTrue(invalid.getMessage().contains("Invalid number at $.value"));

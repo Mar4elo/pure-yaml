@@ -6,6 +6,7 @@ import java.util.List;
 
 public final class YamlSequence implements YamlNode {
     private final List<YamlNode> values = new ArrayList<>();
+    private final List<YamlNode> view = Collections.unmodifiableList(values);
     private final String tag;
     private final String anchor;
 
@@ -31,7 +32,7 @@ public final class YamlSequence implements YamlNode {
     }
 
     public List<YamlNode> values() {
-        return Collections.unmodifiableList(values);
+        return view;
     }
 
     @Override

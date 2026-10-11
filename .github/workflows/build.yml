@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
 
 env:
@@ -25,3 +25,79 @@ jobs:
           git -C "$RUNNER_TEMP/yaml-test-suite" checkout --quiet "$YAML_TEST_SUITE_COMMIT"
           echo "YAML_TEST_SUITE_DIR=$RUNNER_TEMP/yaml-test-suite" >> "$GITHUB_ENV"
       - run: mvn -B verify
+
+  # Publishes a GitHub release v<version> for the version in pom.xml, once per version: pushes that do
+  # not change the version, and -SNAPSHOT versions, are skipped.
+  release:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Read version
+        id: version
+        run: |
+          version=$(mvn -B -q org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate -Dexpression=project.version -DforceStdout)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            echo "Snapshot version $version, no release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "Release v$version already exists"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build jars
+        if: steps.version.outputs.skip != 'true'
+        run: mvn -B package -DskipTests -Djacoco.skip=true -Dspotbugs.skip=true
+      - name: Write release notes
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' 2> /dev/null || true)
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --pretty='- %s' ${previous:+$previous..}HEAD
+            echo
+            echo "## Usage"
+            echo
+            echo "Requires Java 21, no runtime dependencies."
+            echo
+            echo '```xml'
+            echo '<dependency>'
+            echo '    <groupId>io.pure</groupId>'
+            echo '    <artifactId>yaml</artifactId>'
+            echo "    <version>$VERSION</version>"
+            echo '</dependency>'
+            echo '```'
+            if [ -n "$previous" ]; then
+              echo
+              echo "**Full changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$previous...v$VERSION"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+      - name: Publish release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            "target/yaml-$VERSION.jar" \
+            "target/yaml-$VERSION-sources.jar" \
+            "target/yaml-$VERSION-javadoc.jar" \
+            --target "$GITHUB_SHA" \
+            --title "pure-yaml $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md"
